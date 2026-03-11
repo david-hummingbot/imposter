@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <meta name="description" content="Impostor Game – A real-time social deduction word game. Play with friends online!" />
+  <title>Impostor – Social Deduction Game</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ═══════ SCREEN 1 — LOGIN ═══════ -->
+  <div id="screen-login" class="screen active">
+    <div class="login-bg"></div>
+    <div class="card glass fade-in">
+      <div class="logo">
+        <span class="logo-icon">🎭</span>
+        <h1>IMPOSTOR</h1>
+        <p class="subtitle">Social Deduction Game</p>
+      </div>
+
+      <input id="input-name" type="text" placeholder="Enter your name" maxlength="20" autocomplete="off" />
+
+      <button id="btn-create" class="btn btn-primary">Create Game</button>
+
+      <div class="divider"><span>or</span></div>
+
+      <div class="join-row">
+        <input id="input-code" type="text" placeholder="Game Code (6 chars)" maxlength="6" inputmode="text" autocomplete="off" />
+        <button id="btn-join" class="btn btn-secondary">Join</button>
+      </div>
+
+      <p id="login-error" class="error-msg"></p>
+    </div>
+  </div>
+
+  <!-- ═══════ SCREEN 2 — LOBBY ═══════ -->
+  <div id="screen-lobby" class="screen">
+    <div class="card glass fade-in">
+      <p class="label">Game Code</p>
+      <h2 id="lobby-code" class="game-code">----</h2>
+
+      <p class="label">Players</p>
+      <ul id="lobby-players" class="player-list"></ul>
+
+      <div id="host-controls" class="host-controls" style="display:none;">
+        <div class="timer-select">
+          <label for="timer-duration">Discussion Timer</label>
+          <select id="timer-duration">
+            <option value="30">30 seconds</option>
+            <option value="60" selected>60 seconds</option>
+            <option value="90">90 seconds</option>
+            <option value="120">2 minutes</option>
+          </select>
+        </div>
+        <button id="btn-start" class="btn btn-primary">Start Game</button>
+      </div>
+
+      <button id="btn-leave" class="btn btn-ghost">Leave Game</button>
+    </div>
+  </div>
+
+  <!-- ═══════ SCREEN 3 — ASSIGNMENT ═══════ -->
+  <div id="screen-assignment" class="screen">
+    <div class="card glass fade-in assignment-card">
+      <div id="assign-content"></div>
+      <button id="btn-continue" class="btn btn-primary" disabled>Continue</button>
+    </div>
+  </div>
+
+  <!-- ═══════ SCREEN 4 — DESCRIPTION ENTRY ═══════ -->
+  <div id="screen-describe" class="screen">
+    <div class="card glass fade-in">
+      <h2>Describe the Word</h2>
+      <p class="hint">Don't be too obvious!</p>
+
+      <textarea id="input-description" placeholder="Type your clue…" rows="3" maxlength="500"></textarea>
+      <button id="btn-submit-text" class="btn btn-primary">Submit</button>
+
+      <div id="submit-status" class="submit-status"></div>
+    </div>
+  </div>
+
+  <!-- ═══════ SCREEN 5/6 — EVIDENCE BOARD ═══════ -->
+  <div id="screen-evidence" class="screen">
+    <div class="card glass fade-in">
+      <div id="evidence-waiting" style="display:none;">
+        <h2>Waiting for others…</h2>
+        <p id="evidence-counter" class="big-counter">0 / 0</p>
+        <div class="loader"></div>
+      </div>
+
+      <div id="evidence-discussion" style="display:none;">
+        <div class="timer-ring-wrapper">
+          <svg class="timer-ring" viewBox="0 0 120 120">
+            <circle class="timer-ring-bg" cx="60" cy="60" r="54" />
+            <circle id="timer-ring-fg" class="timer-ring-fg" cx="60" cy="60" r="54" />
+          </svg>
+          <span id="timer-text" class="timer-text">60</span>
+        </div>
+
+        <h2>Evidence Board</h2>
+        <ul id="evidence-list" class="evidence-list"></ul>
+
+        <div class="vote-panel">
+          <p class="label">Who do you think is the Impostor?</p>
+          <div class="vote-row">
+            <select id="vote-select"></select>
+            <button id="btn-submit-vote" class="btn btn-secondary">Submit Vote</button>
+          </div>
+          <p id="vote-status" class="vote-status"></p>
+        </div>
+
+        <div class="evidence-actions">
+          <button id="btn-skip-timer" class="btn btn-ghost" style="display:none;">Skip Timer</button>
+          <button id="btn-next-round" class="btn btn-secondary" style="display:none;">Next Round (New Word)</button>
+          <button id="btn-finish-game" class="btn btn-primary" style="display:none;">Finish &amp; Reveal</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════ SCREEN 7 — REVEAL ═══════ -->
+  <div id="screen-reveal" class="screen">
+    <div class="card glass fade-in reveal-card">
+      <p class="label">The word was</p>
+      <h2 id="reveal-word" class="reveal-word">—</h2>
+
+      <p class="label">The Impostor was</p>
+      <h2 id="reveal-impostor" class="reveal-impostor">—</h2>
+
+      <ul id="reveal-descriptions" class="evidence-list"></ul>
+
+      <button id="btn-play-again" class="btn btn-primary" style="display:none;">Play Again</button>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" aria-live="polite"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

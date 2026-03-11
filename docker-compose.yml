@@ -1,0 +1,11 @@
+services:
+  impostor:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+    volumes:
+      # Mount your custom word list. Create words.json or copy from words.json in the repo.
+      - ./words.json:/app/words.json
+    restart: unless-stopped
