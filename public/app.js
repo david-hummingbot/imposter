@@ -152,9 +152,9 @@ btnCreate.addEventListener('click', () => {
 
 btnJoin.addEventListener('click', () => {
     const name = inputName.value.trim();
-    const code = inputCode.value.trim().toUpperCase();
+    const code = inputCode.value.trim().replace(/\D/g, '');
     if (!name) { showError('Please enter your name.'); return; }
-    if (code.length !== 6) { showError('Enter a 6-character game code.'); return; }
+    if (!/^\d{6}$/.test(code)) { showError('Enter the 6-digit game code.'); return; }
     myName = name;
     const storedToken = storedRejoinTokenForCode(code);
     socket.emit('join-room', { code, name, rejoinToken: myRejoinToken || storedToken || undefined }, (res) => {
@@ -227,19 +227,12 @@ function renderLobby(data) {
 function showAssignment(role) {
     myRole = role;
     const isExtraRound = (role.round || 1) > 1;
-    if (role.isImpostor) {
-        assignContent.innerHTML = `
-      <p class="role-label">Your Role</p>
-      <div class="word-display impostor">🕵️ IMPOSTOR</div>
-      <p class="hint">Try to blend in! You don't know the word.</p>
-    `;
-    } else {
-        assignContent.innerHTML = `
+    // Same copy and styling for everyone so the imposter cannot tell from the UI.
+    assignContent.innerHTML = `
       <p class="role-label">${isExtraRound ? 'Same word — add another clue!' : 'The secret word is'}</p>
       <div class="word-display civilian">${escapeHtml(role.word || '')}</div>
       <p class="hint">${isExtraRound ? 'Give one more descriptive clue.' : 'Describe it without being too obvious!'}</p>
     `;
-    }
 
     btnContinue.disabled = true;
     showScreen('screen-assignment');

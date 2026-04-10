@@ -10,7 +10,7 @@ const game = require('./game');
 const MAX_NAME_LEN = 20;
 const MAX_DESC_LEN = 500;
 const VALID_TIMER = [30, 60, 90, 120];
-const ROOM_CODE_REGEX = /^[A-Z0-9]{6}$/i;
+const ROOM_CODE_REGEX = /^\d{6}$/;
 
 function validateCreateRoom(name) {
     if (!name || typeof name !== 'string') return { error: 'Please enter your name.' };
@@ -21,9 +21,9 @@ function validateCreateRoom(name) {
 }
 
 function validateJoinRoom(code, name) {
-    if (!code || typeof code !== 'string') return { error: 'Enter a 6-character game code.' };
-    const trimmedCode = code.trim().toUpperCase();
-    if (!ROOM_CODE_REGEX.test(trimmedCode)) return { error: 'Enter a 6-character game code.' };
+    if (!code || typeof code !== 'string') return { error: 'Enter the 6-digit game code.' };
+    const trimmedCode = code.trim().replace(/\D/g, '');
+    if (!ROOM_CODE_REGEX.test(trimmedCode)) return { error: 'Enter the 6-digit game code.' };
     if (!name || typeof name !== 'string') return { error: 'Please enter your name.' };
     const trimmedName = name.trim();
     if (trimmedName.length === 0) return { error: 'Please enter your name.' };
@@ -144,7 +144,7 @@ function resolveDiscussion(room, io) {
         room.players.forEach((player) => {
             io.to(player.id).emit('game-started', {
                 isImpostor: player.isImpostor,
-                word: player.isImpostor ? null : room.targetWord,
+                word: player.isImpostor ? room.impostorDecoyWord : room.targetWord,
                 round: room.round,
             });
         });
@@ -164,7 +164,10 @@ io.on('connection', (socket) => {
         const validated = validateCreateRoom(name);
         if (validated.error) return socket.emit('error-msg', validated.error);
 
-        const room = game.createRoom(socket.id, validated.name);
+        const room = game.createRoom(socket.id, validated.name, (c) => Boolean(rooms[c]));
+        if (!room) {
+            return socket.emit('error-msg', 'Could not allocate a game code. Please try again.');
+        }
         rooms[room.code] = room;
         socket.join(room.code);
         socket.roomCode = room.code;
@@ -210,7 +213,7 @@ io.on('connection', (socket) => {
                     room.gameState === 'assignment' || room.gameState === 'description'
                         ? {
                               isImpostor: player.isImpostor,
-                              word: player.isImpostor ? null : room.targetWord,
+                              word: player.isImpostor ? room.impostorDecoyWord : room.targetWord,
                               round: room.round,
                           }
                         : undefined,
@@ -279,7 +282,7 @@ io.on('connection', (socket) => {
         room.players.forEach((player) => {
             io.to(player.id).emit('game-started', {
                 isImpostor: player.isImpostor,
-                word: player.isImpostor ? null : room.targetWord,
+                word: player.isImpostor ? room.impostorDecoyWord : room.targetWord,
                 round: room.round,
             });
         });
@@ -353,7 +356,7 @@ io.on('connection', (socket) => {
                     room.players.forEach((player) => {
                         io.to(player.id).emit('game-started', {
                             isImpostor: player.isImpostor,
-                            word: player.isImpostor ? null : room.targetWord,
+                            word: player.isImpostor ? room.impostorDecoyWord : room.targetWord,
                             round: room.round,
                         });
                     });

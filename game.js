@@ -1,30 +1,35 @@
 const crypto = require('crypto');
-const { getRandomWord } = require('./words');
+const { getRandomWord, getRandomWordExcluding } = require('./words');
 
-// Room structure: { code, hostId, players, targetWord, gameState, timerDuration, descriptions, round, votes }
+// Room structure: { code, hostId, players, targetWord, impostorDecoyWord, gameState, timerDuration, descriptions, round, votes }
 // gameState: 'lobby' | 'assignment' | 'description' | 'discussion' | 'reveal'
 
-const ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Exclude confusing chars (0,O,1,I)
-
+/** Six-digit string 000000–999999 (leading zeros preserved). */
 function generateRoomCode() {
-    let code = '';
-    for (let i = 0; i < 6; i++) {
-        code += ROOM_CODE_CHARS.charAt(crypto.randomInt(0, ROOM_CODE_CHARS.length));
-    }
-    return code;
+    const n = crypto.randomInt(0, 1_000_000);
+    return String(n).padStart(6, '0');
 }
 
 function generateRejoinToken() {
     return crypto.randomUUID();
 }
 
-function createRoom(hostId, hostName) {
+/** Optional isCodeTaken(code) retries until a free 6-digit code (create flow only). */
+function createRoom(hostId, hostName, isCodeTaken) {
     const rejoinToken = generateRejoinToken();
+    let code = generateRoomCode();
+    if (typeof isCodeTaken === 'function') {
+        for (let attempt = 0; attempt < 100 && isCodeTaken(code); attempt++) {
+            code = generateRoomCode();
+        }
+        if (isCodeTaken(code)) return null;
+    }
     return {
-        code: generateRoomCode(),
+        code,
         hostId,
         players: [{ id: hostId, name: hostName, isImpostor: false, hasSubmitted: false, connected: true, rejoinToken }],
         targetWord: null,
+        impostorDecoyWord: null,
         gameState: 'lobby',
         timerDuration: 60,
         descriptions: [],
@@ -98,6 +103,7 @@ function startGame(room, timerDuration) {
     room.players[impostorIndex].isImpostor = true;
 
     room.targetWord = getRandomWord();
+    room.impostorDecoyWord = getRandomWordExcluding(room.targetWord);
     room.timerDuration = Number(timerDuration) || 60;
     room.gameState = 'assignment';
     room.round = 1;
@@ -212,6 +218,7 @@ function resetGame(room) {
         p.connected = true;
     });
     room.targetWord = null;
+    room.impostorDecoyWord = null;
     room.gameState = 'lobby';
     room.round = 0;
 }
