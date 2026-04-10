@@ -17,6 +17,26 @@ const socket = io({
 let myId = null;
 let myName = '';
 let myRejoinToken = null; // Prevents session hijacking on reconnect
+
+const REJOIN_STORAGE_PREFIX = 'imposter_rejoin_';
+
+function storedRejoinTokenForCode(code) {
+    if (!code) return null;
+    try {
+        return sessionStorage.getItem(REJOIN_STORAGE_PREFIX + code) || null;
+    } catch {
+        return null;
+    }
+}
+
+function persistRejoinToken(code, token) {
+    if (!code || !token) return;
+    try {
+        sessionStorage.setItem(REJOIN_STORAGE_PREFIX + code, token);
+    } catch {
+        /* private mode / quota */
+    }
+}
 let roomData = null;
 let isHost = false;
 let myRole = null; // { isImpostor, word }
@@ -136,12 +156,16 @@ btnJoin.addEventListener('click', () => {
     if (!name) { showError('Please enter your name.'); return; }
     if (code.length !== 6) { showError('Enter a 6-character game code.'); return; }
     myName = name;
-    socket.emit('join-room', { code, name, rejoinToken: myRejoinToken || undefined }, (res) => {
+    const storedToken = storedRejoinTokenForCode(code);
+    socket.emit('join-room', { code, name, rejoinToken: myRejoinToken || storedToken || undefined }, (res) => {
         if (res.error) {
             showError(res.error);
             return;
         }
-        if (res.rejoinToken) myRejoinToken = res.rejoinToken;
+        if (res.rejoinToken) {
+            myRejoinToken = res.rejoinToken;
+            persistRejoinToken(code, res.rejoinToken);
+        }
         if (res.rejoined) {
             loginError.textContent = '';
             showToast('Reconnecting...');
@@ -434,7 +458,8 @@ socket.on('reconnect', () => {
     // If we already know the room and player name, attempt to rejoin
     // automatically so the server can send us the appropriate rejoin state.
     if (roomData && roomData.code && myName) {
-        socket.emit('join-room', { code: roomData.code, name: myName, rejoinToken: myRejoinToken || undefined }, () => {
+        const storedToken = storedRejoinTokenForCode(roomData.code);
+        socket.emit('join-room', { code: roomData.code, name: myName, rejoinToken: myRejoinToken || storedToken || undefined }, () => {
             // The server will either emit a fresh room-update or a rejoin-state
             // event which our existing handlers already understand.
         });
@@ -496,6 +521,7 @@ socket.on('rejoin-state', (data) => {
 
 socket.on('room-created', ({ code, rejoinToken }) => {
     myRejoinToken = rejoinToken || null;
+    if (rejoinToken) persistRejoinToken(code, rejoinToken);
     showScreen('screen-lobby');
 });
 

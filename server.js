@@ -190,12 +190,10 @@ io.on('connection', (socket) => {
         // Rejoin: must match by rejoinToken (prevents session hijacking by name)
         const existing = rejoinToken ? game.findPlayerByRejoinToken(room, rejoinToken) : null;
         if (existing) {
+            const oldSocketId = existing.id;
+            game.migratePlayerSocketId(room, oldSocketId, socket.id);
             existing.id = socket.id;
             existing.connected = true;
-            // If this player was the host previously, restore hostId mapping
-            if (room.hostId === existing.id || room.hostId === null) {
-                room.hostId = existing.id;
-            }
             socket.join(validated.code);
             socket.roomCode = validated.code;
             callback({ success: true, rejoined: true });
@@ -231,6 +229,24 @@ io.on('connection', (socket) => {
             socket.emit('rejoin-state', rejoinState);
             console.log(`✦ ${existing.name} rejoined room ${validated.code}`);
             return;
+        }
+
+        // Lobby: reclaim disconnected slot by same name so we don't add a second
+        // player row when the client lost its rejoin token (refresh, new tab, etc.).
+        if (room.gameState === 'lobby') {
+            const disconnectedMatch = game.findDisconnectedPlayerByName(room, validated.name);
+            if (disconnectedMatch) {
+                const oldSocketId = disconnectedMatch.id;
+                game.migratePlayerSocketId(room, oldSocketId, socket.id);
+                disconnectedMatch.id = socket.id;
+                disconnectedMatch.connected = true;
+                socket.join(validated.code);
+                socket.roomCode = validated.code;
+                callback({ success: true, rejoinToken: disconnectedMatch.rejoinToken });
+                io.to(validated.code).emit('room-update', game.safeRoom(room));
+                console.log(`✦ ${validated.name} rejoined room ${validated.code} (lobby slot reclaimed)`);
+                return;
+            }
         }
 
         // New player: only allow in lobby.

@@ -46,6 +46,29 @@ function findPlayerByRejoinToken(room, rejoinToken) {
     return room.players.find(p => p.rejoinToken === rejoinToken) || null;
 }
 
+/** Used when rejoining the lobby without a token (e.g. refresh) — merge into the disconnected slot instead of adding a duplicate. */
+function findDisconnectedPlayerByName(room, name) {
+    const trimmed = String(name).trim();
+    return room.players.find(p => p.name === trimmed && p.connected === false) || null;
+}
+
+/** Update stored socket ids when a player reconnects with a new connection id. */
+function migratePlayerSocketId(room, oldId, newId) {
+    if (oldId === newId) return;
+    if (room.hostId === oldId) room.hostId = newId;
+    if (room.votes?.length) {
+        room.votes.forEach((v) => {
+            if (v.voterId === oldId) v.voterId = newId;
+            if (v.targetId === oldId) v.targetId = newId;
+        });
+    }
+    if (room.descriptions?.length) {
+        room.descriptions.forEach((d) => {
+            if (d.playerId === oldId) d.playerId = newId;
+        });
+    }
+}
+
 function removePlayer(room, socketId) {
     const player = room.players.find(p => p.id === socketId);
     if (!player) return;
@@ -175,7 +198,9 @@ function submitDescription(room, playerId, type, data) {
 }
 
 function allSubmitted(room) {
-    return room.players.every(p => p.hasSubmitted);
+    const connected = room.players.filter(p => p.connected !== false);
+    if (connected.length === 0) return false;
+    return connected.every(p => p.hasSubmitted);
 }
 
 function resetGame(room) {
@@ -204,8 +229,8 @@ function safeRoom(room) {
         })),
         gameState: room.gameState,
         timerDuration: room.timerDuration,
-        submittedCount: room.players.filter(p => p.hasSubmitted).length,
-        totalCount: room.players.length,
+        submittedCount: room.players.filter(p => p.connected !== false && p.hasSubmitted).length,
+        totalCount: room.players.filter(p => p.connected !== false).length,
         round: room.round,
     };
 }
@@ -214,6 +239,8 @@ module.exports = {
     createRoom,
     addPlayer,
     findPlayerByRejoinToken,
+    findDisconnectedPlayerByName,
+    migratePlayerSocketId,
     removePlayer,
     startGame,
     startNextRound,
