@@ -483,13 +483,31 @@ select {
 }
 
 /* ─── Evidence / Discussion Panels ─── */
-#evidence-waiting,
-#evidence-discussion {
+#evidence-waiting {
   display: none;
   flex-direction: column;
   align-items: center;
   gap: 16px;
   width: 100%;
+  min-width: 0;
+}
+
+#evidence-discussion {
+  display: none;
+  flex-direction: column;
+  /* Stretch full width — `center` shrinks children to intrinsic width on mobile */
+  align-items: stretch;
+  gap: 16px;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+#evidence-discussion > h2,
+#evidence-discussion > .hint,
+#evidence-discussion > #discussion-status {
+  text-align: center;
+  align-self: stretch;
 }
 
 #evidence-waiting[style*="flex"],
@@ -544,14 +562,33 @@ select {
   flex-wrap: wrap;
   gap: 8px;
   justify-content: flex-end;
+  width: 100%;
+  min-width: 0;
 }
 
 /* ─── Voting Panel ─── */
+/* JS sets `display: flex` when voting — default flex-direction is ROW; force column */
+#vote-panel.vote-panel {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
 .vote-panel {
   width: 100%;
   margin-top: 12px;
   padding-top: 8px;
   border-top: 1px solid var(--glass-border);
+}
+
+.vote-panel .label,
+.vote-panel .vote-hint {
+  width: 100%;
+  max-width: 100%;
 }
 
 .vote-panel .label {
@@ -596,8 +633,11 @@ select {
 }
 
 .vote-candidate-text {
+  display: block;
   text-align: center;
-  word-break: break-word;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 
 .vote-candidate-muted {
@@ -630,12 +670,17 @@ select {
 
 .vote-row {
   display: flex;
+  flex-direction: column;
   gap: 8px;
   margin-top: 4px;
+  width: 100%;
+  min-width: 0;
 }
 
 .vote-row .btn {
   width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .vote-status {

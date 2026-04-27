@@ -552,7 +552,12 @@ function updateEvidenceControls() {
     const isVote = state === 'vote';
     const isDiscussion = state === 'discussion';
 
-    if (votePanel) votePanel.style.display = isVote ? 'flex' : 'none';
+    if (votePanel) {
+        votePanel.style.display = isVote ? 'flex' : 'none';
+        /* Inline flex defaults to row — stack label, hints, candidates, submit vertically */
+        votePanel.style.flexDirection = 'column';
+        votePanel.style.alignItems = 'stretch';
+    }
     // During voting, the selectable cards include names + clues — hide the
     // duplicate read-only list above to avoid repeating the same text twice.
     if (evidenceList) evidenceList.style.display = isVote ? 'none' : '';
