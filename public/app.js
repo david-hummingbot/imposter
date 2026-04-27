@@ -502,9 +502,12 @@ function populateVoteCandidates(descriptions) {
 
     roomData.players.forEach((p, i) => {
         const entry = byPlayer.get(p.id);
-        const cluesHtml = entry && entry.items.length
-            ? entry.items.map((item) => escapeHtml(String(item.data))).join(', ')
-            : '<span class="vote-candidate-empty">No clues yet</span>';
+        let answerHtml;
+        if (entry && entry.items.length) {
+            answerHtml = entry.items.map((item) => escapeHtml(String(item.data))).join(', ');
+        } else {
+            answerHtml = '<span class="vote-candidate-muted">No clues yet</span>';
+        }
 
         const btn = document.createElement('button');
         btn.type = 'button';
@@ -513,12 +516,8 @@ function populateVoteCandidates(descriptions) {
         btn.setAttribute('role', 'radio');
         btn.setAttribute('aria-checked', 'false');
         btn.style.animationDelay = `${i * 0.05}s`;
-        btn.innerHTML = `
-      <span class="vote-candidate-main">
-        <span class="vote-candidate-name">${escapeHtml(p.name)}</span>
-        <span class="vote-candidate-clues">${cluesHtml}</span>
-      </span>
-    `;
+        // Single line: Name — answer (matches in-person voting card layout)
+        btn.innerHTML = `<span class="vote-candidate-text">${escapeHtml(p.name)} — ${answerHtml}</span>`;
         btn.addEventListener('click', () => selectVoteCandidate(p.id));
         voteCandidates.appendChild(btn);
     });
