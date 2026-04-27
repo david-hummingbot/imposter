@@ -95,10 +95,11 @@
         <ul id="evidence-list" class="evidence-list"></ul>
 
         <div id="vote-panel" class="vote-panel" style="display:none;">
-          <p class="label">Who do you think is the Impostor?</p>
+          <p class="label" id="vote-panel-label">Who do you think is the Impostor?</p>
+          <p class="vote-hint hint">Tap a player to select them, then submit your vote.</p>
+          <div id="vote-candidates" class="vote-candidates" role="radiogroup" aria-labelledby="vote-panel-label"></div>
           <div class="vote-row">
-            <select id="vote-select"></select>
-            <button id="btn-submit-vote" class="btn btn-secondary">Submit Vote</button>
+            <button id="btn-submit-vote" class="btn btn-secondary" type="button" disabled>Submit Vote</button>
           </div>
           <p id="vote-status" class="vote-status"></p>
         </div>

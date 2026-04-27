@@ -554,14 +554,87 @@ select {
   border-top: 1px solid var(--glass-border);
 }
 
+.vote-panel .vote-hint {
+  text-align: left;
+  margin-bottom: 10px;
+}
+
+.vote-candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: 12px;
+}
+
+.vote-candidate {
+  display: flex;
+  width: 100%;
+  text-align: left;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.04);
+  border: 2px solid transparent;
+  cursor: pointer;
+  color: var(--text);
+  font-family: inherit;
+  font-size: inherit;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.vote-candidate:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.vote-candidate:focus-visible {
+  outline: none;
+  border-color: rgba(168, 85, 247, 0.6);
+  box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.25);
+}
+
+.vote-candidate.selected {
+  border-color: var(--primary);
+  background: rgba(168, 85, 247, 0.14);
+  box-shadow: 0 0 20px rgba(168, 85, 247, 0.12);
+}
+
+.vote-candidate-main {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+  width: 100%;
+}
+
+.vote-candidate-name {
+  font-weight: 700;
+  font-size: 1rem;
+}
+
+.vote-candidate-clues {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  font-weight: 400;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.vote-candidate-empty {
+  font-style: italic;
+  opacity: 0.65;
+}
+
 .vote-row {
   display: flex;
   gap: 8px;
-  margin-top: 8px;
+  margin-top: 4px;
 }
 
-.vote-row select {
-  flex: 1;
+.vote-row .btn {
+  width: 100%;
 }
 
 .vote-status {

@@ -133,6 +133,9 @@ let roomData = null;
 let isHost = false;
 let myRole = null; // { isImpostor, word }
 let hasVotedThisRound = false;
+let selectedVoteTargetId = null;
+/** Descriptions from the current round — used to show clues next to each name when voting. */
+let lastEvidenceDescriptions = [];
 
 // ─── DOM Refs ───
 const screens = document.querySelectorAll('.screen');
@@ -172,7 +175,7 @@ const votePanel = document.getElementById('vote-panel');
 const btnOpenVoting = document.getElementById('btn-open-voting');
 const btnResolveRound = document.getElementById('btn-resolve-round');
 const btnFinishGame = document.getElementById('btn-finish-game');
-const voteSelect = document.getElementById('vote-select');
+const voteCandidates = document.getElementById('vote-candidates');
 const btnSubmitVote = document.getElementById('btn-submit-vote');
 const voteStatus = document.getElementById('vote-status');
 
@@ -455,8 +458,8 @@ function showEvidenceDiscussion(descriptions, options) {
     evidenceDiscussion.style.display = 'flex';
     showScreen('screen-evidence');
 
-    renderEvidenceList(descriptions || []);
-    populateVoteSelect();
+    lastEvidenceDescriptions = descriptions || [];
+    renderEvidenceList(lastEvidenceDescriptions);
 
     const opts = options || {};
     if (opts.hasVoted != null) hasVotedThisRound = !!opts.hasVoted;
@@ -464,15 +467,20 @@ function showEvidenceDiscussion(descriptions, options) {
     updateEvidenceControls();
 }
 
-function renderEvidenceList(descriptions) {
+function groupDescriptionsByPlayer(descriptions) {
     const byPlayer = new Map();
-    descriptions.forEach((d) => {
+    (descriptions || []).forEach((d) => {
         const key = d.playerId;
         if (!byPlayer.has(key)) {
             byPlayer.set(key, { name: d.playerName, items: [] });
         }
         byPlayer.get(key).items.push({ type: d.type, data: d.data });
     });
+    return byPlayer;
+}
+
+function renderEvidenceList(descriptions) {
+    const byPlayer = groupDescriptionsByPlayer(descriptions);
 
     evidenceList.innerHTML = '';
     let rowIndex = 0;
@@ -486,18 +494,54 @@ function renderEvidenceList(descriptions) {
     });
 }
 
-function populateVoteSelect() {
-    if (!roomData || !roomData.players) return;
-    const previous = voteSelect.value;
-    voteSelect.innerHTML = '';
-    roomData.players.forEach(p => {
-        const option = document.createElement('option');
-        option.value = p.id;
-        option.textContent = p.name;
-        voteSelect.appendChild(option);
+function populateVoteCandidates(descriptions) {
+    if (!voteCandidates || !roomData || !roomData.players) return;
+
+    const byPlayer = groupDescriptionsByPlayer(descriptions);
+    voteCandidates.innerHTML = '';
+
+    roomData.players.forEach((p, i) => {
+        const entry = byPlayer.get(p.id);
+        const cluesHtml = entry && entry.items.length
+            ? entry.items.map((item) => escapeHtml(String(item.data))).join(', ')
+            : '<span class="vote-candidate-empty">No clues yet</span>';
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'vote-candidate';
+        btn.dataset.playerId = p.id;
+        btn.setAttribute('role', 'radio');
+        btn.setAttribute('aria-checked', 'false');
+        btn.style.animationDelay = `${i * 0.05}s`;
+        btn.innerHTML = `
+      <span class="vote-candidate-main">
+        <span class="vote-candidate-name">${escapeHtml(p.name)}</span>
+        <span class="vote-candidate-clues">${cluesHtml}</span>
+      </span>
+    `;
+        btn.addEventListener('click', () => selectVoteCandidate(p.id));
+        voteCandidates.appendChild(btn);
     });
-    if (previous && roomData.players.some(p => p.id === previous)) {
-        voteSelect.value = previous;
+
+    syncVoteSelectionUI();
+}
+
+function selectVoteCandidate(playerId) {
+    if (!roomData || roomData.gameState !== 'vote') return;
+    selectedVoteTargetId = playerId;
+    syncVoteSelectionUI();
+}
+
+function syncVoteSelectionUI() {
+    if (!voteCandidates) return;
+    voteCandidates.querySelectorAll('.vote-candidate').forEach((el) => {
+        const id = el.dataset.playerId;
+        const on = id === selectedVoteTargetId;
+        el.classList.toggle('selected', on);
+        el.setAttribute('aria-checked', on ? 'true' : 'false');
+    });
+    if (btnSubmitVote) {
+        btnSubmitVote.disabled = !selectedVoteTargetId;
     }
 }
 
@@ -510,6 +554,9 @@ function updateEvidenceControls() {
     const isDiscussion = state === 'discussion';
 
     if (votePanel) votePanel.style.display = isVote ? 'flex' : 'none';
+    // During voting, the selectable cards include names + clues — hide the
+    // duplicate read-only list above to avoid repeating the same text twice.
+    if (evidenceList) evidenceList.style.display = isVote ? 'none' : '';
 
     if (discussionStatus) {
         if (isDiscussion) {
@@ -528,10 +575,7 @@ function updateEvidenceControls() {
     }
 
     if (isVote) {
-        // Voting stays open until the round resolves so players can change
-        // their pick freely; the server keeps only their latest vote.
-        voteSelect.disabled = false;
-        btnSubmitVote.disabled = false;
+        populateVoteCandidates(lastEvidenceDescriptions);
         voteStatus.textContent = hasVotedThisRound
             ? 'Vote submitted. You can change your pick until the round resolves.'
             : '';
@@ -577,10 +621,9 @@ btnFinishGame.addEventListener('click', () => {
 });
 
 btnSubmitVote.addEventListener('click', () => {
-    const targetId = voteSelect.value;
-    if (!targetId) return;
+    if (!selectedVoteTargetId) return;
     if (!roomData || roomData.gameState !== 'vote') return;
-    socket.emit('cast-vote', { targetId });
+    socket.emit('cast-vote', { targetId: selectedVoteTargetId });
     hasVotedThisRound = true;
     voteStatus.textContent = 'Vote submitted. You can change your pick until the round resolves.';
 });
@@ -828,12 +871,15 @@ socket.on('game-started', (role) => {
     inputDescription.disabled = false;
     inputDescription.value = '';
     submitStatus.textContent = '';
+    hasVotedThisRound = false;
+    selectedVoteTargetId = null;
 
     showAssignment(role);
 });
 
 socket.on('all-submitted', ({ descriptions }) => {
     hasVotedThisRound = false;
+    selectedVoteTargetId = null;
     showEvidenceDiscussion(descriptions);
 });
 
@@ -841,8 +887,7 @@ socket.on('voting-opened', () => {
     // Voting was just opened by the host. Clear any per-player vote UI state
     // so players can submit a fresh vote for this round.
     hasVotedThisRound = false;
-    if (voteSelect) voteSelect.disabled = false;
-    if (btnSubmitVote) btnSubmitVote.disabled = false;
+    selectedVoteTargetId = null;
     if (voteStatus) voteStatus.textContent = '';
     updateEvidenceControls();
 });
@@ -855,6 +900,7 @@ socket.on('back-to-lobby', () => {
     // Reset local state (keep myRejoinToken for rejoin)
     myRole = null;
     hasVotedThisRound = false;
+    selectedVoteTargetId = null;
 
     // Reset UI elements
     btnSubmitText.disabled = false;
