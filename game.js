@@ -1,8 +1,15 @@
 const crypto = require('crypto');
 const { getRandomWord, getRandomWordExcluding } = require('./words');
 
-// Room structure: { code, hostId, players, targetWord, impostorDecoyWord, gameState, timerDuration, descriptions, round, votes }
-// gameState: 'lobby' | 'assignment' | 'description' | 'discussion' | 'reveal'
+// Room structure:
+// { code, hostId, players, targetWord, impostorDecoyWord, gameState,
+//   descriptions, round, votes, socketByPlayer (runtime), updatedAt }
+//
+// Identity model: every player record uses a STABLE client-generated UUID
+// (`playerId`) as `player.id`. Vote and description records reference the
+// same playerId, so socket churn during reconnects no longer corrupts state.
+// Per-player direct messaging on the server uses room.socketByPlayer to look
+// up the current socket for a given playerId.
 
 /** Six-digit string 000000–999999 (leading zeros preserved). */
 function generateRoomCode() {
@@ -15,7 +22,7 @@ function generateRejoinToken() {
 }
 
 /** Optional isCodeTaken(code) retries until a free 6-digit code (create flow only). */
-function createRoom(hostId, hostName, isCodeTaken) {
+function createRoom(hostPlayerId, hostName, isCodeTaken) {
     const rejoinToken = generateRejoinToken();
     let code = generateRoomCode();
     if (typeof isCodeTaken === 'function') {
@@ -26,23 +33,38 @@ function createRoom(hostId, hostName, isCodeTaken) {
     }
     return {
         code,
-        hostId,
-        players: [{ id: hostId, name: hostName, isImpostor: false, hasSubmitted: false, connected: true, rejoinToken }],
+        hostId: hostPlayerId,
+        players: [{
+            id: hostPlayerId,
+            name: hostName,
+            isImpostor: false,
+            hasSubmitted: false,
+            connected: true,
+            rejoinToken,
+        }],
         targetWord: null,
         impostorDecoyWord: null,
         gameState: 'lobby',
-        timerDuration: 60,
         descriptions: [],
         round: 0,
         votes: [],
+        socketByPlayer: {},
+        updatedAt: Date.now(),
     };
 }
 
-function addPlayer(room, socketId, name) {
-    if (room.players.find(p => p.id === socketId)) return false;
+function addPlayer(room, playerId, name) {
+    if (room.players.find(p => p.id === playerId)) return false;
     if (room.gameState !== 'lobby') return false;
     const rejoinToken = generateRejoinToken();
-    room.players.push({ id: socketId, name, isImpostor: false, hasSubmitted: false, connected: true, rejoinToken });
+    room.players.push({
+        id: playerId,
+        name,
+        isImpostor: false,
+        hasSubmitted: false,
+        connected: true,
+        rejoinToken,
+    });
     return { rejoinToken };
 }
 
@@ -51,43 +73,56 @@ function findPlayerByRejoinToken(room, rejoinToken) {
     return room.players.find(p => p.rejoinToken === rejoinToken) || null;
 }
 
-/** Used when rejoining the lobby without a token (e.g. refresh) — merge into the disconnected slot instead of adding a duplicate. */
+/** Used when rejoining without a token (e.g. wiped storage) — merge into the disconnected slot instead of adding a duplicate. */
 function findDisconnectedPlayerByName(room, name) {
     const trimmed = String(name).trim();
     return room.players.find(p => p.name === trimmed && p.connected === false) || null;
 }
 
-/** Update stored socket ids when a player reconnects with a new connection id. */
-function migratePlayerSocketId(room, oldId, newId) {
-    if (oldId === newId) return;
-    if (room.hostId === oldId) room.hostId = newId;
-    if (room.votes?.length) {
-        room.votes.forEach((v) => {
-            if (v.voterId === oldId) v.voterId = newId;
-            if (v.targetId === oldId) v.targetId = newId;
-        });
-    }
-    if (room.descriptions?.length) {
-        room.descriptions.forEach((d) => {
-            if (d.playerId === oldId) d.playerId = newId;
-        });
-    }
-}
-
-function removePlayer(room, socketId) {
-    const player = room.players.find(p => p.id === socketId);
+/**
+ * Mark a player as disconnected. Their record (votes, descriptions, host
+ * status) is preserved so they can resume on reconnect. Use kickPlayer() to
+ * fully remove a player.
+ */
+function removePlayer(room, playerId) {
+    const player = room.players.find(p => p.id === playerId);
     if (!player) return;
     player.connected = false;
-    // If host left, assign new host among still-connected players
-    if (socketId === room.hostId) {
-        const replacement = room.players.find(p => p.connected && p.id !== socketId);
+    if (room.socketByPlayer) delete room.socketByPlayer[playerId];
+    if (playerId === room.hostId) {
+        const replacement = room.players.find(p => p.connected && p.id !== playerId);
         if (replacement) {
             room.hostId = replacement.id;
         }
     }
 }
 
-function startGame(room, timerDuration) {
+/**
+ * Fully remove a player record and any state they contributed (votes,
+ * descriptions). If the kicked player was the host, transfer host to the
+ * next still-connected player. Returns the removed player or null.
+ */
+function kickPlayer(room, playerId) {
+    const idx = room.players.findIndex(p => p.id === playerId);
+    if (idx === -1) return null;
+    const [removed] = room.players.splice(idx, 1);
+    if (room.socketByPlayer) delete room.socketByPlayer[playerId];
+    if (room.votes) {
+        room.votes = room.votes.filter(v => v.voterId !== playerId && v.targetId !== playerId);
+    }
+    if (room.descriptions) {
+        room.descriptions = room.descriptions.filter(d => d.playerId !== playerId);
+    }
+    if (playerId === room.hostId) {
+        const replacement = room.players.find(p => p.connected) || room.players[0];
+        if (replacement) {
+            room.hostId = replacement.id;
+        }
+    }
+    return removed;
+}
+
+function startGame(room) {
     if (room.players.length < 2) return { error: 'Need at least 2 players to start.' };
 
     // Reset all previous state
@@ -98,13 +133,14 @@ function startGame(room, timerDuration) {
         p.hasSubmitted = false;
     });
 
-    // Assign impostor at random (cryptographically secure)
-    const impostorIndex = crypto.randomInt(0, room.players.length);
-    room.players[impostorIndex].isImpostor = true;
+    // Assign impostor at random among connected players (cryptographically secure)
+    const eligible = room.players.filter(p => p.connected !== false);
+    const pool = eligible.length ? eligible : room.players;
+    const impostorIndex = crypto.randomInt(0, pool.length);
+    pool[impostorIndex].isImpostor = true;
 
     room.targetWord = getRandomWord();
     room.impostorDecoyWord = getRandomWordExcluding(room.targetWord);
-    room.timerDuration = Number(timerDuration) || 60;
     room.gameState = 'assignment';
     room.round = 1;
 
@@ -152,43 +188,6 @@ function votingComplete(room) {
     return connectedPlayers.every(p => voterIds.has(p.id));
 }
 
-// Compute majority outcome and whether impostor was correctly guessed.
-function getVoteOutcome(room) {
-    const connectedPlayers = room.players.filter(p => p.connected !== false);
-    if (connectedPlayers.length === 0) return null;
-    const connectedIds = new Set(connectedPlayers.map(p => p.id));
-    const votes = (room.votes || []).filter(v => connectedIds.has(v.voterId));
-    if (votes.length === 0) return null;
-
-    const counts = {};
-    votes.forEach(v => {
-        counts[v.targetId] = (counts[v.targetId] || 0) + 1;
-    });
-
-    let topId = null;
-    let topCount = 0;
-    Object.entries(counts).forEach(([id, count]) => {
-        if (count > topCount) {
-            topId = id;
-            topCount = count;
-        }
-    });
-
-    const total = votes.length;
-    const majority = Math.floor(total / 2) + 1;
-    const hasMajority = topCount >= majority;
-    const impostor = room.players.find(p => p.isImpostor);
-    const guessedImpostor = hasMajority && impostor && topId === impostor.id;
-
-    return {
-        hasMajority,
-        guessedImpostor,
-        topId,
-        topCount,
-        total,
-    };
-}
-
 function clearVotes(room) {
     room.votes = [];
 }
@@ -225,6 +224,9 @@ function resetGame(room) {
 
 function safeRoom(room) {
     // Return room data safe to broadcast (no sensitive impostor info publicly exposed)
+    const connectedPlayers = room.players.filter(p => p.connected !== false);
+    const voterIds = new Set((room.votes || []).map(v => v.voterId));
+    const votedCount = connectedPlayers.filter(p => voterIds.has(p.id)).length;
     return {
         code: room.code,
         hostId: room.hostId,
@@ -235,9 +237,9 @@ function safeRoom(room) {
             connected: p.connected,
         })),
         gameState: room.gameState,
-        timerDuration: room.timerDuration,
-        submittedCount: room.players.filter(p => p.connected !== false && p.hasSubmitted).length,
-        totalCount: room.players.filter(p => p.connected !== false).length,
+        submittedCount: connectedPlayers.filter(p => p.hasSubmitted).length,
+        totalCount: connectedPlayers.length,
+        votedCount,
         round: room.round,
     };
 }
@@ -247,8 +249,8 @@ module.exports = {
     addPlayer,
     findPlayerByRejoinToken,
     findDisconnectedPlayerByName,
-    migratePlayerSocketId,
     removePlayer,
+    kickPlayer,
     startGame,
     startNextRound,
     submitDescription,
@@ -257,6 +259,5 @@ module.exports = {
     safeRoom,
     castVote,
     votingComplete,
-    getVoteOutcome,
     clearVotes,
 };

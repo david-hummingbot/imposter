@@ -335,6 +335,14 @@ select {
   flex-shrink: 0;
 }
 
+.player-list li .player-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .player-list li .host-badge {
   margin-left: auto;
   font-size: 0.7rem;
@@ -342,6 +350,50 @@ select {
   text-transform: uppercase;
   letter-spacing: 1px;
   font-weight: 600;
+  flex-shrink: 0;
+}
+
+.player-list li .offline-badge {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+}
+
+.player-list li.player-disconnected {
+  opacity: 0.55;
+}
+
+.player-list li .btn-kick {
+  margin-left: 4px;
+  background: transparent;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: var(--danger);
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+.player-list li .btn-kick:hover {
+  background: rgba(239, 68, 68, 0.15);
+  border-color: var(--danger);
+  transform: scale(1.05);
+}
+.player-list li .btn-kick:active {
+  transform: scale(0.95);
 }
 
 /* ─── Host Controls ─── */
@@ -349,22 +401,6 @@ select {
   display: flex;
   flex-direction: column;
   gap: 12px;
-}
-
-.timer-select {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.timer-select label {
-  font-size: 0.85rem;
-  color: var(--text-dim);
-  white-space: nowrap;
-}
-
-.timer-select select {
-  flex: 1;
 }
 
 /* ─── Assignment ─── */
@@ -444,54 +480,6 @@ select {
   to {
     transform: rotate(360deg);
   }
-}
-
-/* ─── Timer Ring ─── */
-.timer-ring-wrapper {
-  position: relative;
-  width: 120px;
-  height: 120px;
-  margin: 0 auto 12px;
-}
-
-.timer-ring {
-  width: 100%;
-  height: 100%;
-  transform: rotate(-90deg);
-}
-
-.timer-ring-bg {
-  fill: none;
-  stroke: rgba(255, 255, 255, 0.08);
-  stroke-width: 6;
-}
-
-.timer-ring-fg {
-  fill: none;
-  stroke: var(--primary);
-  stroke-width: 6;
-  stroke-linecap: round;
-  stroke-dasharray: 339.292;
-  stroke-dashoffset: 0;
-  transition: stroke-dashoffset 1s linear, stroke 0.3s;
-}
-
-.timer-ring-fg.warning {
-  stroke: var(--accent);
-}
-
-.timer-ring-fg.danger {
-  stroke: var(--danger);
-}
-
-.timer-text {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 2rem;
-  font-weight: 800;
 }
 
 /* ─── Evidence / Discussion Panels ─── */
@@ -625,6 +613,79 @@ select {
 .toast.visible {
   transform: translateX(-50%) translateY(0);
   opacity: 1;
+}
+
+/* ─── Connection Status Pip ─── */
+.connection-status {
+  position: fixed;
+  bottom: 12px;
+  right: 12px;
+  z-index: 99;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 4px 8px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid var(--glass-border);
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  pointer-events: none;
+  transition: opacity 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+  opacity: 0.85;
+}
+
+.connection-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: background 0.3s ease, box-shadow 0.3s ease;
+  flex-shrink: 0;
+}
+
+.connection-status.connected {
+  color: var(--success);
+  border-color: rgba(34, 197, 94, 0.4);
+  opacity: 0.6;
+}
+.connection-status.connected .connection-dot {
+  background: var(--success);
+  box-shadow: 0 0 6px rgba(34, 197, 94, 0.6);
+}
+
+.connection-status.connecting {
+  color: #eab308;
+  border-color: rgba(234, 179, 8, 0.5);
+  opacity: 1;
+}
+.connection-status.connecting .connection-dot {
+  background: #eab308;
+  box-shadow: 0 0 6px rgba(234, 179, 8, 0.6);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.connection-status.failed,
+.connection-status.disconnected {
+  color: var(--danger);
+  border-color: rgba(239, 68, 68, 0.5);
+  opacity: 1;
+}
+.connection-status.failed .connection-dot,
+.connection-status.disconnected .connection-dot {
+  background: var(--danger);
+  box-shadow: 0 0 6px rgba(239, 68, 68, 0.6);
+}
+
+/* Hide the label text on small screens to keep the pip compact. */
+@media (max-width: 480px) {
+  .connection-status .connection-label {
+    display: none;
+  }
+  .connection-status {
+    padding: 6px;
+  }
 }
 
 /* ─── Landscape / larger screens ─── */

@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -5,12 +6,22 @@ const path = require('path');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const game = require('./game');
+const persistence = require('./persistence');
 
 // ─── Input validation (limits, sanitization) ───
 const MAX_NAME_LEN = 20;
 const MAX_DESC_LEN = 500;
-const VALID_TIMER = [30, 60, 90, 120];
+const MAX_PLAYER_ID_LEN = 128;
 const ROOM_CODE_REGEX = /^\d{6}$/;
+
+function sanitisePlayerId(raw) {
+    if (typeof raw !== 'string') return null;
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.length > MAX_PLAYER_ID_LEN) return null;
+    // Allow URL-safe characters only — UUIDs, opaque tokens, etc.
+    if (!/^[A-Za-z0-9_\-]+$/.test(trimmed)) return null;
+    return trimmed;
+}
 
 function validateCreateRoom(name) {
     if (!name || typeof name !== 'string') return { error: 'Please enter your name.' };
@@ -40,11 +51,6 @@ function validateDescription(type, data) {
     return trimmed;
 }
 
-function validateTimerDuration(val) {
-    const n = Number(val);
-    return VALID_TIMER.includes(n) ? n : 60;
-}
-
 const app = express();
 
 // Security headers
@@ -64,230 +70,249 @@ const server = http.createServer(app);
 // Socket.IO server with slightly more lenient heartbeat settings to reduce
 // disconnects on flaky or sleeping mobile connections.
 const io = new Server(server, {
-    // How often to send pings (ms). Default is 25000; we keep it but make
-    // timeout more forgiving below.
     pingInterval: 25000,
-    // How long the server will wait for a pong before considering the client
-    // disconnected. A higher value reduces false disconnects on mobile.
     pingTimeout: 60000,
 });
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// In-memory rooms store
-const rooms = {};
+// In-memory rooms store (hydrated from disk on boot, persisted on mutation).
+let rooms = {};
 
-// Per-socket rate limiting for join-room (brute-force mitigation)
+// Per-playerId rate limiting (a misbehaving client can no longer reset its
+// limit by churning through socket connections, since playerId is stable).
 const JOIN_RATE_WINDOW_MS = 60 * 1000;
 const MAX_JOINS_PER_WINDOW = 15;
 const MAX_CREATE_PER_WINDOW = 10;
 const joinAttempts = new Map();
 const createAttempts = new Map();
 
-function checkJoinRateLimit(socketId) {
+function checkRateLimit(map, key, max) {
+    if (!key) return true;
     const now = Date.now();
-    let record = joinAttempts.get(socketId);
-    if (!record) {
+    let record = map.get(key);
+    if (!record || now > record.resetAt) {
         record = { count: 0, resetAt: now + JOIN_RATE_WINDOW_MS };
-        joinAttempts.set(socketId, record);
-    }
-    if (now > record.resetAt) {
-        record.count = 0;
-        record.resetAt = now + JOIN_RATE_WINDOW_MS;
+        map.set(key, record);
     }
     record.count++;
-    return record.count <= MAX_JOINS_PER_WINDOW;
+    return record.count <= max;
 }
 
-function cleanupJoinRateLimit(socketId) {
-    joinAttempts.delete(socketId);
-    createAttempts.delete(socketId);
-}
-
-function checkCreateRateLimit(socketId) {
+function pruneRateLimits() {
     const now = Date.now();
-    let record = createAttempts.get(socketId);
-    if (!record) {
-        record = { count: 0, resetAt: now + JOIN_RATE_WINDOW_MS };
-        createAttempts.set(socketId, record);
+    for (const [k, v] of joinAttempts) {
+        if (now > v.resetAt) joinAttempts.delete(k);
     }
-    if (now > record.resetAt) {
-        record.count = 0;
-        record.resetAt = now + JOIN_RATE_WINDOW_MS;
+    for (const [k, v] of createAttempts) {
+        if (now > v.resetAt) createAttempts.delete(k);
     }
-    record.count++;
-    return record.count <= MAX_CREATE_PER_WINDOW;
 }
+
+setInterval(pruneRateLimits, 5 * 60 * 1000);
 
 // When a room becomes empty, we keep it around for a short grace period so
 // that mobile clients that briefly lose connectivity (screen lock, network
 // handoff, etc.) can reconnect without the room being destroyed immediately.
 const EMPTY_ROOM_GRACE_MS = 5 * 60 * 1000; // 5 minutes
 
-// Resolve discussion: if everyone voted and majority got the impostor → reveal; else → next round (same word).
-function resolveDiscussion(room, io) {
-    if (room.gameState !== 'discussion') return;
-    const allVoted = game.votingComplete(room);
-    const outcome = game.getVoteOutcome(room);
-    if (allVoted && outcome && outcome.hasMajority && outcome.guessedImpostor) {
+// ─── Helpers ───
+
+function touchRoom(room) {
+    if (room) room.updatedAt = Date.now();
+}
+
+function broadcastRoom(room) {
+    if (!room) return;
+    touchRoom(room);
+    io.to(room.code).emit('room-update', game.safeRoom(room));
+    persistence.schedulePersist(rooms);
+}
+
+function emitToPlayer(playerId, event, payload) {
+    if (!playerId) return;
+    io.to(playerId).emit(event, payload);
+}
+
+function bindSocketToPlayer(socket, room) {
+    if (!room || !socket || !socket.playerId) return;
+    if (!room.socketByPlayer) room.socketByPlayer = {};
+    room.socketByPlayer[socket.playerId] = socket.id;
+}
+
+// Resolve the current vote (see plan: connected-player majority threshold).
+function resolveDiscussion(room) {
+    if (room.gameState !== 'vote') return;
+
+    const impostor = room.players.find(p => p.isImpostor);
+    const connectedCount = room.players.filter(p => p.connected !== false).length;
+    const threshold = Math.floor(connectedCount / 2); // strictly more than half wins
+    const tally = {};
+    (room.votes || []).forEach((v) => {
+        tally[v.targetId] = (tally[v.targetId] || 0) + 1;
+    });
+    const impostorVotes = (impostor && tally[impostor.id]) || 0;
+    const crewWon = !!impostor && impostorVotes > threshold;
+
+    if (crewWon) {
         room.gameState = 'reveal';
         io.to(room.code).emit('reveal', {
             word: room.targetWord,
-            impostor: room.players.find(p => p.isImpostor),
+            impostor,
             descriptions: room.descriptions,
         });
-        io.to(room.code).emit('room-update', game.safeRoom(room));
-    } else {
-        // Majority didn't vote, or impostor not correctly identified → next round (same word, more descriptions)
-        const result = game.startNextRound(room);
-        if (result.error) return;
-        room.players.forEach((player) => {
-            io.to(player.id).emit('game-started', {
-                isImpostor: player.isImpostor,
-                word: player.isImpostor ? room.impostorDecoyWord : room.targetWord,
-                round: room.round,
-            });
-        });
-        io.to(room.code).emit('room-update', game.safeRoom(room));
-        console.log(`✦ Next round (same word) in room ${room.code}. Word: ${room.targetWord}`);
+        broadcastRoom(room);
+        return;
     }
+
+    const result = game.startNextRound(room);
+    if (result.error) return;
+    room.players.forEach((player) => {
+        emitToPlayer(player.id, 'game-started', {
+            isImpostor: player.isImpostor,
+            word: player.isImpostor ? room.impostorDecoyWord : room.targetWord,
+            round: room.round,
+        });
+    });
+    broadcastRoom(room);
+    console.log(`✦ Next round (same word) in room ${room.code}. Word: ${room.targetWord}`);
 }
 
+// ─── Auth: every socket carries its stable playerId via handshake auth. ───
+io.use((socket, next) => {
+    const auth = socket.handshake?.auth || {};
+    const provided = sanitisePlayerId(auth.playerId);
+    // Lenient: accept any reasonable string the client sent. Generate one
+    // server-side when missing so legacy clients don't break — they just
+    // lose the persistence benefits until they update.
+    socket.playerId = provided || crypto.randomUUID();
+    next();
+});
+
 io.on('connection', (socket) => {
-    console.log(`✦ Connected: ${socket.id}`);
+    // Each socket joins a private Socket.IO room named after its playerId so
+    // we can target this player with `io.to(playerId).emit(...)` regardless
+    // of which underlying socketId they currently hold.
+    socket.join(socket.playerId);
+
+    console.log(`✦ Connected: socket=${socket.id} player=${socket.playerId}`);
 
     // ────── CREATE ROOM ──────
     socket.on('create-room', ({ name }) => {
-        if (!checkCreateRateLimit(socket.id)) {
+        if (!checkRateLimit(createAttempts, socket.playerId, MAX_CREATE_PER_WINDOW)) {
             return socket.emit('error-msg', 'Too many rooms created. Please wait a minute.');
         }
         const validated = validateCreateRoom(name);
         if (validated.error) return socket.emit('error-msg', validated.error);
 
-        const room = game.createRoom(socket.id, validated.name, (c) => Boolean(rooms[c]));
+        const room = game.createRoom(socket.playerId, validated.name, (c) => Boolean(rooms[c]));
         if (!room) {
             return socket.emit('error-msg', 'Could not allocate a game code. Please try again.');
         }
         rooms[room.code] = room;
+        bindSocketToPlayer(socket, room);
         socket.join(room.code);
         socket.roomCode = room.code;
         const hostToken = room.players[0].rejoinToken;
         socket.emit('room-created', { code: room.code, rejoinToken: hostToken });
-        io.to(room.code).emit('room-update', game.safeRoom(room));
+        broadcastRoom(room);
         console.log(`✦ Room ${room.code} created by ${validated.name}`);
     });
 
     // ────── JOIN ROOM ──────
     socket.on('join-room', ({ code, name, rejoinToken }, callback) => {
-        if (!checkJoinRateLimit(socket.id)) {
-            return callback({ error: 'Too many join attempts. Please wait a minute.' });
+        const cb = typeof callback === 'function' ? callback : () => { };
+        if (!checkRateLimit(joinAttempts, socket.playerId, MAX_JOINS_PER_WINDOW)) {
+            return cb({ error: 'Too many join attempts. Please wait a minute.' });
         }
         const validated = validateJoinRoom(code, name);
-        if (validated.error) return callback({ error: validated.error });
+        if (validated.error) return cb({ error: validated.error });
 
         const room = rooms[validated.code];
         if (!room) {
-            return callback({ error: 'Room not found. Check the code and try again.' });
+            return cb({ error: 'Room not found. Check the code and try again.' });
         }
 
-        // Rejoin: must match by rejoinToken (prevents session hijacking by name)
+        // 1) Strongest match: rejoinToken (cryptographic, prevents hijacking).
         const existing = rejoinToken ? game.findPlayerByRejoinToken(room, rejoinToken) : null;
         if (existing) {
-            const oldSocketId = existing.id;
-            game.migratePlayerSocketId(room, oldSocketId, socket.id);
-            existing.id = socket.id;
-            existing.connected = true;
-            socket.join(validated.code);
-            socket.roomCode = validated.code;
-            callback({ success: true, rejoined: true });
-            io.to(validated.code).emit('room-update', game.safeRoom(room));
-
-            // Send reconnecting client the state they need to restore their screen
-            const player = existing;
-            const hasVoted = (room.votes || []).some((v) => v.voterId === socket.id);
-            const rejoinState = {
-                gameState: room.gameState,
-                hasSubmitted: player.hasSubmitted,
-                hasVoted,
-                role:
-                    room.gameState === 'assignment' || room.gameState === 'description'
-                        ? {
-                              isImpostor: player.isImpostor,
-                              word: player.isImpostor ? room.impostorDecoyWord : room.targetWord,
-                              round: room.round,
-                          }
-                        : undefined,
-                descriptions: room.gameState === 'discussion' || room.gameState === 'reveal' ? room.descriptions : undefined,
-                timerDuration: room.timerDuration,
-                discussionStartedAt: room.discussionStartedAt,
-                reveal:
-                    room.gameState === 'reveal'
-                        ? {
-                              word: room.targetWord,
-                              impostor: room.players.find((p) => p.isImpostor),
-                              descriptions: room.descriptions,
-                          }
-                        : undefined,
-            };
-            socket.emit('rejoin-state', rejoinState);
-            console.log(`✦ ${existing.name} rejoined room ${validated.code}`);
+            adoptExistingPlayer(socket, room, existing);
+            cb({ success: true, rejoined: true });
+            sendRejoinState(socket, room, existing);
+            console.log(`✦ ${existing.name} rejoined room ${validated.code} (token)`);
             return;
         }
 
-        // Lobby: reclaim disconnected slot by same name so we don't add a second
-        // player row when the client lost its rejoin token (refresh, new tab, etc.).
-        if (room.gameState === 'lobby') {
-            const disconnectedMatch = game.findDisconnectedPlayerByName(room, validated.name);
-            if (disconnectedMatch) {
-                const oldSocketId = disconnectedMatch.id;
-                game.migratePlayerSocketId(room, oldSocketId, socket.id);
-                disconnectedMatch.id = socket.id;
-                disconnectedMatch.connected = true;
-                socket.join(validated.code);
-                socket.roomCode = validated.code;
-                callback({ success: true, rejoinToken: disconnectedMatch.rejoinToken });
-                io.to(validated.code).emit('room-update', game.safeRoom(room));
-                console.log(`✦ ${validated.name} rejoined room ${validated.code} (lobby slot reclaimed)`);
-                return;
-            }
+        // 2) Implicit identity match: the client's stable playerId already
+        //    has a record in the room (e.g. localStorage rejoinToken got
+        //    wiped but playerId persisted). Trust playerId here because the
+        //    client provided it via handshake auth before any user input.
+        const byPlayerId = room.players.find(p => p.id === socket.playerId);
+        if (byPlayerId) {
+            adoptExistingPlayer(socket, room, byPlayerId);
+            cb({ success: true, rejoined: true, rejoinToken: byPlayerId.rejoinToken });
+            sendRejoinState(socket, room, byPlayerId);
+            console.log(`✦ ${byPlayerId.name} rejoined room ${validated.code} (playerId)`);
+            return;
         }
 
-        // New player: only allow in lobby.
+        // 3) Name-match fallback: a disconnected slot with this exact name.
+        //    Allowed in any state so a player whose storage was wiped can
+        //    still come back mid-game. We rotate their rejoinToken and
+        //    reassign the player record's id to this socket's stable
+        //    playerId so future reconnects use the strong path above.
+        const disconnectedMatch = game.findDisconnectedPlayerByName(room, validated.name);
+        if (disconnectedMatch) {
+            // Rebind the slot to the new stable playerId, and rewrite any
+            // votes/descriptions that referenced the old one.
+            const oldPlayerId = disconnectedMatch.id;
+            if (oldPlayerId !== socket.playerId) {
+                rewritePlayerId(room, oldPlayerId, socket.playerId);
+            }
+            disconnectedMatch.rejoinToken = crypto.randomUUID();
+            adoptExistingPlayer(socket, room, disconnectedMatch);
+            cb({ success: true, rejoined: true, rejoinToken: disconnectedMatch.rejoinToken });
+            sendRejoinState(socket, room, disconnectedMatch);
+            console.log(`✦ ${disconnectedMatch.name} rejoined room ${validated.code} (name fallback)`);
+            return;
+        }
+
+        // 4) Genuinely new player → only allowed in lobby.
         if (room.gameState !== 'lobby') {
-            return callback({ error: 'Game already in progress.' });
+            return cb({ error: 'Game already in progress.' });
         }
-        const result = game.addPlayer(room, socket.id, validated.name);
+        const result = game.addPlayer(room, socket.playerId, validated.name);
         if (!result) {
-            return callback({ error: 'Could not join room.' });
+            return cb({ error: 'Could not join room.' });
         }
+        bindSocketToPlayer(socket, room);
         socket.join(validated.code);
         socket.roomCode = validated.code;
-        callback({ success: true, rejoinToken: result.rejoinToken });
-        io.to(validated.code).emit('room-update', game.safeRoom(room));
+        room.emptySince = null;
+        cb({ success: true, rejoinToken: result.rejoinToken });
+        broadcastRoom(room);
         console.log(`✦ ${validated.name} joined room ${validated.code}`);
     });
 
     // ────── START GAME ──────
-    socket.on('start-game', ({ timerDuration }) => {
+    socket.on('start-game', () => {
         const room = rooms[socket.roomCode];
-        if (!room || room.hostId !== socket.id) return;
+        if (!room || room.hostId !== socket.playerId) return;
 
-        const safeDuration = validateTimerDuration(timerDuration);
-        const result = game.startGame(room, safeDuration);
+        const result = game.startGame(room);
         if (result.error) {
             return socket.emit('error-msg', result.error);
         }
 
-        // Send private assignment to each player
         room.players.forEach((player) => {
-            io.to(player.id).emit('game-started', {
+            emitToPlayer(player.id, 'game-started', {
                 isImpostor: player.isImpostor,
                 word: player.isImpostor ? room.impostorDecoyWord : room.targetWord,
                 round: room.round,
             });
         });
 
-        io.to(room.code).emit('room-update', game.safeRoom(room));
+        broadcastRoom(room);
         console.log(`✦ Game started in room ${room.code}. Word: ${room.targetWord}`);
     });
 
@@ -295,33 +320,30 @@ io.on('connection', (socket) => {
     socket.on('continue-to-describe', () => {
         const room = rooms[socket.roomCode];
         if (!room) return;
+        if (room.gameState !== 'assignment') return;
         room.gameState = 'description';
-        io.to(room.code).emit('room-update', game.safeRoom(room));
+        broadcastRoom(room);
     });
 
     // ────── SUBMIT DESCRIPTION ──────
     socket.on('submit-description', ({ type, data }) => {
         const room = rooms[socket.roomCode];
         if (!room) return;
+        if (room.gameState !== 'description') return;
 
         const validatedData = validateDescription(type, data);
         if (!validatedData) return;
 
-        const submitted = game.submitDescription(room, socket.id, 'text', validatedData);
+        const submitted = game.submitDescription(room, socket.playerId, 'text', validatedData);
         if (!submitted) return;
 
-        io.to(room.code).emit('room-update', game.safeRoom(room));
+        broadcastRoom(room);
 
-        // If all submitted → go to discussion
         if (game.allSubmitted(room)) {
             room.gameState = 'discussion';
-            room.discussionStartedAt = Date.now();
             game.clearVotes(room);
-            io.to(room.code).emit('all-submitted', {
-                descriptions: room.descriptions,
-                timerDuration: room.timerDuration,
-            });
-            io.to(room.code).emit('room-update', game.safeRoom(room));
+            io.to(room.code).emit('all-submitted', { descriptions: room.descriptions });
+            broadcastRoom(room);
             console.log(`✦ All descriptions in for room ${room.code}`);
         }
     });
@@ -330,131 +352,236 @@ io.on('connection', (socket) => {
     socket.on('cast-vote', ({ targetId }) => {
         const room = rooms[socket.roomCode];
         if (!room) return;
-        if (room.gameState !== 'discussion') return;
+        if (room.gameState !== 'vote') return;
+        if (typeof targetId !== 'string') return;
 
-        const ok = game.castVote(room, socket.id, targetId);
+        const ok = game.castVote(room, socket.playerId, targetId);
         if (!ok) return;
 
-        // When all connected players have voted, resolve the round.
+        broadcastRoom(room);
+
         if (game.votingComplete(room)) {
-            const outcome = game.getVoteOutcome(room);
-            if (outcome && outcome.hasMajority && outcome.guessedImpostor) {
-                // Majority correctly identified the impostor → end game.
-                room.gameState = 'reveal';
-                io.to(room.code).emit('reveal', {
-                    word: room.targetWord,
-                    impostor: room.players.find(p => p.isImpostor),
-                    descriptions: room.descriptions,
-                });
-                io.to(room.code).emit('room-update', game.safeRoom(room));
-            } else {
-                // No correct majority → automatically move to next round.
-                const result = game.startNextRound(room);
-                if (result.error) {
-                    socket.emit('error-msg', result.error);
-                } else {
-                    room.players.forEach((player) => {
-                        io.to(player.id).emit('game-started', {
-                            isImpostor: player.isImpostor,
-                            word: player.isImpostor ? room.impostorDecoyWord : room.targetWord,
-                            round: room.round,
-                        });
-                    });
-                    io.to(room.code).emit('room-update', game.safeRoom(room));
-                    console.log(`✦ Next round (auto) in room ${room.code}. Word: ${room.targetWord}`);
-                }
-            }
-            game.clearVotes(room);
+            resolveDiscussion(room);
         }
     });
 
-    // ────── SKIP TIMER (Host) ──────
-    socket.on('skip-timer', () => {
+    // ────── FORCE ADVANCE TO DISCUSSION (Host) ──────
+    socket.on('force-advance-to-discussion', () => {
         const room = rooms[socket.roomCode];
-        if (!room || room.hostId !== socket.id) return;
-        resolveDiscussion(room, io);
+        if (!room || room.hostId !== socket.playerId) return;
+        if (room.gameState !== 'description') return;
+
+        room.gameState = 'discussion';
+        game.clearVotes(room);
+        io.to(room.code).emit('all-submitted', { descriptions: room.descriptions });
+        broadcastRoom(room);
+        console.log(`✦ Host force-advanced room ${room.code} to discussion (${room.descriptions.length} clue(s) submitted)`);
     });
 
-    // ────── TIMER EXPIRED ──────
-    socket.on('timer-expired', () => {
+    // ────── OPEN VOTING (Host) ──────
+    socket.on('open-voting', () => {
         const room = rooms[socket.roomCode];
-        if (!room) return;
-        if (room.gameState === 'reveal') return;
-        resolveDiscussion(room, io);
-    });
-
-    // ────── NEXT ROUND (Host) ──────
-    socket.on('next-round', () => {
-        const room = rooms[socket.roomCode];
-        if (!room || room.hostId !== socket.id) return;
+        if (!room || room.hostId !== socket.playerId) return;
         if (room.gameState !== 'discussion') return;
-        resolveDiscussion(room, io);
+
+        room.gameState = 'vote';
+        game.clearVotes(room);
+        io.to(room.code).emit('voting-opened');
+        broadcastRoom(room);
+        console.log(`✦ Host opened voting in room ${room.code}`);
+    });
+
+    // ────── RESOLVE ROUND (Host) ──────
+    socket.on('resolve-round', () => {
+        const room = rooms[socket.roomCode];
+        if (!room || room.hostId !== socket.playerId) return;
+        if (room.gameState !== 'vote') return;
+        resolveDiscussion(room);
     });
 
     // ────── FINISH GAME (Host) ──────
     socket.on('finish-game', () => {
         const room = rooms[socket.roomCode];
-        if (!room || room.hostId !== socket.id) return;
+        if (!room || room.hostId !== socket.playerId) return;
+        if (room.gameState !== 'discussion' && room.gameState !== 'vote') return;
 
         room.gameState = 'reveal';
-
         io.to(room.code).emit('reveal', {
             word: room.targetWord,
             impostor: room.players.find(p => p.isImpostor),
             descriptions: room.descriptions,
         });
-        io.to(room.code).emit('room-update', game.safeRoom(room));
+        broadcastRoom(room);
+    });
+
+    // ────── KICK PLAYER (Host) ──────
+    socket.on('kick-player', ({ playerId }) => {
+        const room = rooms[socket.roomCode];
+        if (!room || room.hostId !== socket.playerId) return;
+        if (typeof playerId !== 'string') return;
+        if (playerId === socket.playerId) return; // host can't kick themselves
+
+        const removed = game.kickPlayer(room, playerId);
+        if (!removed) return;
+
+        // Force the kicked player's sockets out of the game room and tell
+        // them they've been removed so their UI returns to the login screen.
+        io.to(playerId).emit('kicked', { code: room.code });
+        const kickedSockets = io.sockets.adapter.rooms.get(playerId);
+        if (kickedSockets) {
+            for (const sid of kickedSockets) {
+                const s = io.sockets.sockets.get(sid);
+                if (s && s.roomCode === room.code) {
+                    s.leave(room.code);
+                    s.roomCode = null;
+                }
+            }
+        }
+
+        broadcastRoom(room);
+        console.log(`✦ Host kicked ${removed.name} (${playerId}) from room ${room.code}`);
     });
 
     // ────── PLAY AGAIN ──────
     socket.on('play-again', () => {
         const room = rooms[socket.roomCode];
-        if (!room || room.hostId !== socket.id) return;
+        if (!room || room.hostId !== socket.playerId) return;
         game.resetGame(room);
-        io.to(room.code).emit('room-update', game.safeRoom(room));
+        broadcastRoom(room);
         io.to(room.code).emit('back-to-lobby');
         console.log(`✦ Room ${room.code} reset to lobby`);
     });
 
     // ────── DISCONNECT ──────
     socket.on('disconnect', () => {
-        cleanupJoinRateLimit(socket.id);
         const room = rooms[socket.roomCode];
-        if (room) {
-            game.removePlayer(room, socket.id);
-            const anyConnected = room.players.some(p => p.connected);
-            if (!anyConnected) {
-                // Mark when the room first became empty; a periodic sweeper
-                // will clean up long-empty rooms after a grace period.
-                if (!room.emptySince) {
-                    room.emptySince = Date.now();
-                }
-                console.log(`✦ Room ${socket.roomCode} is now empty; starting grace period timer`);
-            } else {
-                // At least one player still connected; ensure we don't treat
-                // this room as empty anymore.
-                room.emptySince = null;
-                io.to(room.code).emit('room-update', game.safeRoom(room));
-            }
+        if (!room) return;
+
+        // Only mark the player disconnected if THIS socket is the one
+        // currently mapped to them. Otherwise a second tab opening would
+        // immediately appear to disconnect the active session.
+        const currentSocketId = room.socketByPlayer && room.socketByPlayer[socket.playerId];
+        if (currentSocketId && currentSocketId !== socket.id) {
+            return;
         }
-        console.log(`✦ Disconnected: ${socket.id}`);
+
+        game.removePlayer(room, socket.playerId);
+        const anyConnected = room.players.some(p => p.connected);
+        if (!anyConnected) {
+            if (!room.emptySince) room.emptySince = Date.now();
+            console.log(`✦ Room ${socket.roomCode} is now empty; starting grace period timer`);
+            persistence.schedulePersist(rooms);
+        } else {
+            room.emptySince = null;
+            broadcastRoom(room);
+        }
+        console.log(`✦ Disconnected: socket=${socket.id} player=${socket.playerId}`);
     });
 });
+
+// Adopt an existing player record for the current socket (rebinds room
+// membership, marks connected, refreshes socket map).
+function adoptExistingPlayer(socket, room, player) {
+    player.connected = true;
+    bindSocketToPlayer(socket, room);
+    socket.join(room.code);
+    socket.roomCode = room.code;
+    room.emptySince = null;
+    broadcastRoom(room);
+}
+
+function sendRejoinState(socket, room, player) {
+    const hasVoted = (room.votes || []).some((v) => v.voterId === player.id);
+    const includeDescriptions =
+        room.gameState === 'discussion' ||
+        room.gameState === 'vote' ||
+        room.gameState === 'reveal';
+    const rejoinState = {
+        gameState: room.gameState,
+        hasSubmitted: player.hasSubmitted,
+        hasVoted,
+        role:
+            room.gameState === 'assignment' || room.gameState === 'description'
+                ? {
+                    isImpostor: player.isImpostor,
+                    word: player.isImpostor ? room.impostorDecoyWord : room.targetWord,
+                    round: room.round,
+                }
+                : undefined,
+        descriptions: includeDescriptions ? room.descriptions : undefined,
+        reveal:
+            room.gameState === 'reveal'
+                ? {
+                    word: room.targetWord,
+                    impostor: room.players.find((p) => p.isImpostor),
+                    descriptions: room.descriptions,
+                }
+                : undefined,
+    };
+    socket.emit('rejoin-state', rejoinState);
+}
+
+// Rewrite all references from oldPlayerId → newPlayerId in a room. Used by
+// the name-match rejoin path so the stable playerId on the socket replaces
+// whatever the disconnected slot used to have.
+function rewritePlayerId(room, oldPlayerId, newPlayerId) {
+    if (!room || oldPlayerId === newPlayerId) return;
+    room.players.forEach((p) => {
+        if (p.id === oldPlayerId) p.id = newPlayerId;
+    });
+    if (room.hostId === oldPlayerId) room.hostId = newPlayerId;
+    if (Array.isArray(room.votes)) {
+        room.votes.forEach((v) => {
+            if (v.voterId === oldPlayerId) v.voterId = newPlayerId;
+            if (v.targetId === oldPlayerId) v.targetId = newPlayerId;
+        });
+    }
+    if (Array.isArray(room.descriptions)) {
+        room.descriptions.forEach((d) => {
+            if (d.playerId === oldPlayerId) d.playerId = newPlayerId;
+        });
+    }
+    if (room.socketByPlayer && room.socketByPlayer[oldPlayerId]) {
+        room.socketByPlayer[newPlayerId] = room.socketByPlayer[oldPlayerId];
+        delete room.socketByPlayer[oldPlayerId];
+    }
+}
 
 // Periodically sweep and delete rooms that have been empty for longer than
-// the configured grace period. This allows short mobile disconnects without
-// losing room state, while still reclaiming memory for abandoned rooms.
+// the configured grace period.
 setInterval(() => {
     const now = Date.now();
-    Object.entries(rooms).forEach(([code, room]) => {
+    let dirty = false;
+    for (const [code, room] of Object.entries(rooms)) {
         if (room.emptySince && now - room.emptySince > EMPTY_ROOM_GRACE_MS) {
             delete rooms[code];
+            dirty = true;
             console.log(`✦ Room ${code} deleted after being empty for more than ${EMPTY_ROOM_GRACE_MS / 60000} minutes`);
         }
-    });
+    }
+    if (dirty) persistence.schedulePersist(rooms);
 }, 60 * 1000);
 
+// Persist on graceful shutdown so an in-flight write doesn't lose state.
+function shutdown(reason) {
+    console.log(`✦ Shutting down (${reason}); flushing persistence...`);
+    persistence.flush().finally(() => process.exit(0));
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`\n  🎭 Impostor Game server running on http://localhost:${PORT}\n`);
-});
+
+(async function bootstrap() {
+    try {
+        rooms = await persistence.loadRooms();
+        const count = Object.keys(rooms).length;
+        if (count > 0) console.log(`✦ Restored ${count} room(s) from disk`);
+    } catch (e) {
+        console.error('✦ Failed to load persisted rooms; starting fresh.', e.message);
+        rooms = {};
+    }
+    server.listen(PORT, () => {
+        console.log(`\n  🎭 Impostor Game server running on http://localhost:${PORT}\n`);
+    });
+})();

@@ -47,15 +47,6 @@
       <ul id="lobby-players" class="player-list"></ul>
 
       <div id="host-controls" class="host-controls" style="display:none;">
-        <div class="timer-select">
-          <label for="timer-duration">Discussion Timer</label>
-          <select id="timer-duration">
-            <option value="30">30 seconds</option>
-            <option value="60" selected>60 seconds</option>
-            <option value="90">90 seconds</option>
-            <option value="120">2 minutes</option>
-          </select>
-        </div>
         <button id="btn-start" class="btn btn-primary">Start Game</button>
       </div>
 
@@ -81,6 +72,10 @@
       <button id="btn-submit-text" class="btn btn-primary">Submit</button>
 
       <div id="submit-status" class="submit-status"></div>
+
+      <div id="describe-host-actions" class="evidence-actions" style="display:none;">
+        <button id="btn-force-advance" class="btn btn-secondary" title="Skip waiting and move everyone to the discussion phase">Force Start Discussion</button>
+      </div>
     </div>
   </div>
 
@@ -94,18 +89,12 @@
       </div>
 
       <div id="evidence-discussion" style="display:none;">
-        <div class="timer-ring-wrapper">
-          <svg class="timer-ring" viewBox="0 0 120 120">
-            <circle class="timer-ring-bg" cx="60" cy="60" r="54" />
-            <circle id="timer-ring-fg" class="timer-ring-fg" cx="60" cy="60" r="54" />
-          </svg>
-          <span id="timer-text" class="timer-text">60</span>
-        </div>
-
         <h2>Evidence Board</h2>
+        <p id="discussion-status" class="hint">Discuss the clues. The host will open voting when everyone is ready.</p>
+
         <ul id="evidence-list" class="evidence-list"></ul>
 
-        <div class="vote-panel">
+        <div id="vote-panel" class="vote-panel" style="display:none;">
           <p class="label">Who do you think is the Impostor?</p>
           <div class="vote-row">
             <select id="vote-select"></select>
@@ -115,9 +104,9 @@
         </div>
 
         <div class="evidence-actions">
-          <button id="btn-skip-timer" class="btn btn-ghost" style="display:none;">Skip Timer</button>
-          <button id="btn-next-round" class="btn btn-secondary" style="display:none;">Next Round (New Word)</button>
-          <button id="btn-finish-game" class="btn btn-primary" style="display:none;">Finish &amp; Reveal</button>
+          <button id="btn-open-voting" class="btn btn-primary" style="display:none;">Open Voting</button>
+          <button id="btn-resolve-round" class="btn btn-secondary" style="display:none;">Resolve Round</button>
+          <button id="btn-finish-game" class="btn btn-ghost" style="display:none;">Force Reveal</button>
         </div>
       </div>
     </div>
@@ -139,6 +128,11 @@
   </div>
 
   <div id="toast" class="toast" aria-live="polite"></div>
+
+  <div id="connection-status" class="connection-status connecting" title="Connecting...">
+    <span class="connection-dot" aria-hidden="true"></span>
+    <span class="connection-label">Connecting...</span>
+  </div>
 
   <script src="/socket.io/socket.io.js"></script>
   <script src="app.js"></script>

@@ -2,10 +2,64 @@
    IMPOSTOR GAME — Client Application
    ═══════════════════════════════════════════ */
 
-// Configure Socket.IO to be more resilient on mobile networks by preferring
-// WebSocket and using generous reconnection behavior.
+// ═══════════════════════════════════════════
+//  PERSISTENT SESSION (localStorage)
+// ═══════════════════════════════════════════
+// Three-layer persistence so a refresh, tab restore, or cold load can put
+// the player back into their game without having to re-type code/name:
+//   1. A stable `playerId` that lives forever in localStorage and rides the
+//      Socket.IO handshake `auth.playerId`. The server uses it as the
+//      primary identity, so reconnects no longer need to remap socket ids.
+//   2. Per-code rejoin tokens (long-lived; useful even after Leave Game).
+//   3. A single "active session" pointer describing the room the player is
+//      currently in. Combined with the ?join=CODE URL deep link, this lets
+//      the page reload itself straight back into the active game.
+
+const PLAYER_ID_KEY = 'imposter_player_id_v1';
+const REJOIN_STORAGE_PREFIX = 'imposter_rejoin_';
+const ACTIVE_SESSION_KEY = 'imposter_active_session_v1';
+
+function safeLocalGet(key) {
+    try { return localStorage.getItem(key); } catch { return null; }
+}
+function safeLocalSet(key, value) {
+    try { localStorage.setItem(key, value); } catch { /* private mode / quota */ }
+}
+function safeLocalRemove(key) {
+    try { localStorage.removeItem(key); } catch { /* ignore */ }
+}
+
+function generateUuid() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+    }
+    // Fallback for older browsers; not RFC4122 but unique enough as an
+    // opaque identifier on the wire.
+    return `pid-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getOrCreatePlayerId() {
+    const existing = safeLocalGet(PLAYER_ID_KEY);
+    if (existing && typeof existing === 'string' && /^[A-Za-z0-9_\-]{1,128}$/.test(existing)) {
+        return existing;
+    }
+    const fresh = generateUuid();
+    safeLocalSet(PLAYER_ID_KEY, fresh);
+    return fresh;
+}
+
+const myPlayerId = getOrCreatePlayerId();
+
+// Configure Socket.IO to be more resilient on mobile networks. We allow both
+// WebSocket and HTTP long-polling — some carrier proxies, captive portals and
+// corporate networks block or downgrade WS, and falling back to polling lets
+// the handshake still succeed (the client will silently upgrade to WS when
+// possible). The stable playerId is sent in handshake auth on every (re)
+// connect so the server can identify us without relying on socket.id.
 const socket = io({
-    transports: ['websocket'],
+    auth: { playerId: myPlayerId },
+    transports: ['websocket', 'polling'],
+    upgrade: true,
     reconnection: true,
     reconnectionAttempts: Infinity,
     reconnectionDelay: 1000,
@@ -14,35 +68,71 @@ const socket = io({
 });
 
 // ─── State ───
-let myId = null;
+let myId = myPlayerId; // alias: the stable identity the server sees us as
 let myName = '';
-let myRejoinToken = null; // Prevents session hijacking on reconnect
-
-const REJOIN_STORAGE_PREFIX = 'imposter_rejoin_';
+let myRejoinToken = null; // Cryptographic token; preferred over playerId match
 
 function storedRejoinTokenForCode(code) {
     if (!code) return null;
+    return safeLocalGet(REJOIN_STORAGE_PREFIX + code);
+}
+
+function persistRejoinToken(code, token) {
+    if (!code || !token) return;
+    safeLocalSet(REJOIN_STORAGE_PREFIX + code, token);
+}
+
+function readActiveSession() {
+    const raw = safeLocalGet(ACTIVE_SESSION_KEY);
+    if (!raw) return null;
     try {
-        return sessionStorage.getItem(REJOIN_STORAGE_PREFIX + code) || null;
+        const obj = JSON.parse(raw);
+        if (obj && typeof obj === 'object' && obj.code && obj.name) return obj;
+    } catch { /* fall through */ }
+    return null;
+}
+
+function writeActiveSession({ code, name, rejoinToken }) {
+    if (!code || !name) return;
+    const payload = { code, name };
+    if (rejoinToken) payload.rejoinToken = rejoinToken;
+    safeLocalSet(ACTIVE_SESSION_KEY, JSON.stringify(payload));
+}
+
+function clearActiveSession() {
+    safeLocalRemove(ACTIVE_SESSION_KEY);
+}
+
+// ═══════════════════════════════════════════
+//  URL DEEP LINK ( ?join=CODE )
+// ═══════════════════════════════════════════
+// Mirrors the reference implementation: while a player is in a room, the
+// game code lives in the URL so any reload, deep-link share, or browser
+// "restore tab" lands the player straight back into that room.
+
+function readJoinCodeFromUrl() {
+    try {
+        const c = new URLSearchParams(location.search).get('join');
+        if (!c) return null;
+        return String(c).trim().replace(/\D/g, '').slice(0, 6) || null;
     } catch {
         return null;
     }
 }
 
-function persistRejoinToken(code, token) {
-    if (!code || !token) return;
+function setUrlJoinCode(code) {
     try {
-        sessionStorage.setItem(REJOIN_STORAGE_PREFIX + code, token);
-    } catch {
-        /* private mode / quota */
-    }
+        const url = new URL(location.href);
+        if (code) url.searchParams.set('join', code);
+        else url.searchParams.delete('join');
+        history.replaceState({}, '', url.pathname + (url.search || '') + url.hash);
+    } catch { /* ignore */ }
 }
+
 let roomData = null;
 let isHost = false;
 let myRole = null; // { isImpostor, word }
-
-// Discussion timer
-let discussionInterval = null;
+let hasVotedThisRound = false;
 
 // ─── DOM Refs ───
 const screens = document.querySelectorAll('.screen');
@@ -58,7 +148,6 @@ const loginError = document.getElementById('login-error');
 const lobbyCode = document.getElementById('lobby-code');
 const lobbyPlayers = document.getElementById('lobby-players');
 const hostControls = document.getElementById('host-controls');
-const timerDuration = document.getElementById('timer-duration');
 const btnStart = document.getElementById('btn-start');
 const btnLeave = document.getElementById('btn-leave');
 
@@ -70,16 +159,18 @@ const btnContinue = document.getElementById('btn-continue');
 const inputDescription = document.getElementById('input-description');
 const btnSubmitText = document.getElementById('btn-submit-text');
 const submitStatus = document.getElementById('submit-status');
+const describeHostActions = document.getElementById('describe-host-actions');
+const btnForceAdvance = document.getElementById('btn-force-advance');
 
 // Evidence
 const evidenceWaiting = document.getElementById('evidence-waiting');
 const evidenceDiscussion = document.getElementById('evidence-discussion');
 const evidenceCounter = document.getElementById('evidence-counter');
-const timerRingFg = document.getElementById('timer-ring-fg');
-const timerText = document.getElementById('timer-text');
 const evidenceList = document.getElementById('evidence-list');
-const btnSkipTimer = document.getElementById('btn-skip-timer');
-const btnNextRound = document.getElementById('btn-next-round');
+const discussionStatus = document.getElementById('discussion-status');
+const votePanel = document.getElementById('vote-panel');
+const btnOpenVoting = document.getElementById('btn-open-voting');
+const btnResolveRound = document.getElementById('btn-resolve-round');
 const btnFinishGame = document.getElementById('btn-finish-game');
 const voteSelect = document.getElementById('vote-select');
 const btnSubmitVote = document.getElementById('btn-submit-vote');
@@ -120,6 +211,22 @@ function showToast(message) {
     toastEl._hide = setTimeout(() => {
         toastEl.classList.remove('visible');
     }, 3000);
+}
+
+// ═══════════════════════════════════════════
+//  CONNECTION STATUS PIP
+// ═══════════════════════════════════════════
+// Persistent visual indicator so players always know whether the live
+// connection is healthy, retrying, or fully failed. Driven by the Socket.IO
+// lifecycle handlers below.
+const connectionStatusEl = document.getElementById('connection-status');
+function setConnectionStatus(state, label) {
+    if (!connectionStatusEl) return;
+    connectionStatusEl.classList.remove('connected', 'connecting', 'failed', 'disconnected');
+    connectionStatusEl.classList.add(state);
+    if (label) connectionStatusEl.title = label;
+    const labelEl = connectionStatusEl.querySelector('.connection-label');
+    if (labelEl && label) labelEl.textContent = label;
 }
 
 // ═══════════════════════════════════════════
@@ -166,6 +273,10 @@ btnJoin.addEventListener('click', () => {
             myRejoinToken = res.rejoinToken;
             persistRejoinToken(code, res.rejoinToken);
         }
+        // Persist this session and bake the code into the URL so a refresh,
+        // tab restore, or shared link puts the player straight back here.
+        writeActiveSession({ code, name, rejoinToken: res.rejoinToken || myRejoinToken });
+        setUrlJoinCode(code);
         if (res.rejoined) {
             loginError.textContent = '';
             showToast('Reconnecting...');
@@ -193,31 +304,60 @@ function showError(msg) {
 // ═══════════════════════════════════════════
 
 btnLeave.addEventListener('click', () => {
-    location.reload();
+    // Explicit "Leave" — drop the persistent session so we don't auto-rejoin
+    // the same room on the next load, and clear the deep-link query string.
+    clearActiveSession();
+    setUrlJoinCode(null);
+    location.href = location.pathname;
 });
 
 btnStart.addEventListener('click', () => {
-    socket.emit('start-game', { timerDuration: timerDuration.value });
+    socket.emit('start-game');
 });
 
 function renderLobby(data) {
     lobbyCode.textContent = data.code;
     lobbyPlayers.innerHTML = '';
+    isHost = data.hostId === myId;
+
     data.players.forEach((p, i) => {
         const li = document.createElement('li');
         li.style.animationDelay = `${i * 0.06}s`;
         const safeName = escapeHtml(p.name);
         const initial = escapeHtml((p.name || '').charAt(0).toUpperCase()) || '?';
+        const isDisconnected = p.connected === false;
+        if (isDisconnected) li.classList.add('player-disconnected');
+        const showKick = isHost && p.id !== myId;
+        const kickBtn = showKick
+            ? `<button class="btn-kick" data-player-id="${escapeHtml(p.id)}" aria-label="Remove ${safeName}" title="Remove ${safeName}">✕</button>`
+            : '';
+        const offlineBadge = isDisconnected ? '<span class="offline-badge">offline</span>' : '';
         li.innerHTML = `
       <span class="player-avatar" style="background:${getAvatarColor(i)}">${initial}</span>
-      <span>${safeName}</span>
+      <span class="player-name">${safeName}</span>
       ${p.id === data.hostId ? '<span class="host-badge">Host</span>' : ''}
+      ${offlineBadge}
+      ${kickBtn}
     `;
         lobbyPlayers.appendChild(li);
     });
 
-    isHost = data.hostId === myId;
     hostControls.style.display = isHost ? 'flex' : 'none';
+}
+
+// Event delegation: a single click handler on the lobby list dispatches kicks
+// regardless of how many times we re-render the player rows.
+if (lobbyPlayers) {
+    lobbyPlayers.addEventListener('click', (e) => {
+        const btn = e.target.closest('.btn-kick');
+        if (!btn) return;
+        const targetId = btn.dataset.playerId;
+        if (!targetId || !isHost) return;
+        const target = (roomData && roomData.players || []).find(p => p.id === targetId);
+        const targetName = target ? target.name : 'this player';
+        if (!confirm(`Remove ${targetName} from the room? They'll be returned to the login screen.`)) return;
+        socket.emit('kick-player', { playerId: targetId });
+    });
 }
 
 // ═══════════════════════════════════════════
@@ -261,6 +401,36 @@ btnSubmitText.addEventListener('click', () => {
     inputDescription.disabled = true;
 });
 
+// ─── Host: Force-start discussion ───
+// Lets the host unstick a round when one or more players are disconnected
+// or unable to submit, instead of forcing a full game restart.
+if (btnForceAdvance) {
+    btnForceAdvance.addEventListener('click', () => {
+        if (!isHost) return;
+        const submitted = (roomData && roomData.submittedCount) || 0;
+        const total = (roomData && roomData.totalCount) || 0;
+        const remaining = Math.max(0, total - submitted);
+        const msg = remaining > 0
+            ? `Force start discussion now? ${remaining} player(s) haven't submitted — they'll be skipped.`
+            : 'Force start discussion now?';
+        if (!confirm(msg)) return;
+        socket.emit('force-advance-to-discussion');
+    });
+}
+
+function updateDescribeHostControls() {
+    if (!describeHostActions || !btnForceAdvance) return;
+    const inDescribe = roomData && roomData.gameState === 'description';
+    if (!isHost || !inDescribe) {
+        describeHostActions.style.display = 'none';
+        return;
+    }
+    describeHostActions.style.display = 'flex';
+    const submitted = roomData.submittedCount || 0;
+    const total = roomData.totalCount || 0;
+    btnForceAdvance.textContent = `Force Start Discussion (${submitted} / ${total} submitted)`;
+}
+
 // ═══════════════════════════════════════════
 //  EVIDENCE BOARD
 // ═══════════════════════════════════════════
@@ -276,14 +446,27 @@ function updateCounter(data) {
     evidenceCounter.textContent = `${data.submittedCount} / ${data.totalCount}`;
 }
 
-function showEvidenceDiscussion(descriptions, duration, rejoinOptions) {
+// Render the evidence/voting screen. The same screen serves both the
+// "discussion" phase (clues only, no voting) and the "vote" phase (voting
+// panel visible). The host advances between them with the explicit Open
+// Voting / Resolve Round / Force Reveal controls below.
+function showEvidenceDiscussion(descriptions, options) {
     evidenceWaiting.style.display = 'none';
     evidenceDiscussion.style.display = 'flex';
     showScreen('screen-evidence');
 
-    // Group descriptions by player (one line per player, all rounds combined)
+    renderEvidenceList(descriptions || []);
+    populateVoteSelect();
+
+    const opts = options || {};
+    if (opts.hasVoted != null) hasVotedThisRound = !!opts.hasVoted;
+
+    updateEvidenceControls();
+}
+
+function renderEvidenceList(descriptions) {
     const byPlayer = new Map();
-    (descriptions || []).forEach((d) => {
+    descriptions.forEach((d) => {
         const key = d.playerId;
         if (!byPlayer.has(key)) {
             byPlayer.set(key, { name: d.playerName, items: [] });
@@ -301,87 +484,105 @@ function showEvidenceDiscussion(descriptions, duration, rejoinOptions) {
         evidenceList.appendChild(li);
         rowIndex++;
     });
+}
 
-    // Populate voting options
-    if (roomData && roomData.players) {
-        voteSelect.innerHTML = '';
-        roomData.players.forEach(p => {
-            const option = document.createElement('option');
-            option.value = p.id;
-            option.textContent = p.name;
-            voteSelect.appendChild(option);
-        });
-        const alreadyVoted = rejoinOptions && rejoinOptions.hasVoted;
-        voteSelect.disabled = alreadyVoted;
-        btnSubmitVote.disabled = alreadyVoted;
-        voteStatus.textContent = alreadyVoted ? 'Vote submitted. Waiting for others...' : '';
-    }
-
-    // Host controls during discussion
-    btnSkipTimer.style.display = isHost ? 'inline-flex' : 'none';
-    btnNextRound.style.display = isHost ? 'inline-flex' : 'none';
-    btnFinishGame.style.display = isHost ? 'inline-flex' : 'none';
-
-    // Start countdown (rejoin: use remaining seconds)
-    const remaining = rejoinOptions && rejoinOptions.remainingSeconds != null ? rejoinOptions.remainingSeconds : duration;
-    const total = rejoinOptions && rejoinOptions.totalSeconds != null ? rejoinOptions.totalSeconds : duration;
-    if (remaining > 0) {
-        startDiscussionTimer(remaining, total);
-    } else {
-        timerText.textContent = '0';
-        timerRingFg.style.strokeDashoffset = 339.292;
+function populateVoteSelect() {
+    if (!roomData || !roomData.players) return;
+    const previous = voteSelect.value;
+    voteSelect.innerHTML = '';
+    roomData.players.forEach(p => {
+        const option = document.createElement('option');
+        option.value = p.id;
+        option.textContent = p.name;
+        voteSelect.appendChild(option);
+    });
+    if (previous && roomData.players.some(p => p.id === previous)) {
+        voteSelect.value = previous;
     }
 }
 
-function startDiscussionTimer(remainingSeconds, totalSeconds) {
-    let remaining = remainingSeconds;
-    const total = totalSeconds != null ? totalSeconds : remainingSeconds;
-    const circumference = 339.292; // 2 * PI * 54
+// Sync the evidence screen's vote panel + host controls to the current room
+// state. Called on entry and on every room-update while the screen is open.
+function updateEvidenceControls() {
+    if (!roomData) return;
+    const state = roomData.gameState;
+    const isVote = state === 'vote';
+    const isDiscussion = state === 'discussion';
 
-    timerText.textContent = remaining;
-    timerRingFg.style.strokeDashoffset = 0;
-    timerRingFg.classList.remove('warning', 'danger');
+    if (votePanel) votePanel.style.display = isVote ? 'flex' : 'none';
 
-    clearInterval(discussionInterval);
-    discussionInterval = setInterval(() => {
-        remaining--;
-        timerText.textContent = remaining;
-
-        const progress = 1 - remaining / total;
-        timerRingFg.style.strokeDashoffset = circumference * progress;
-
-        if (remaining <= 10) timerRingFg.classList.add('danger');
-        else if (remaining <= total * 0.3) timerRingFg.classList.add('warning');
-
-        if (remaining <= 0) {
-            clearInterval(discussionInterval);
-            socket.emit('timer-expired');
+    if (discussionStatus) {
+        if (isDiscussion) {
+            discussionStatus.textContent = isHost
+                ? 'Discuss the clues with your group. Tap Open Voting when ready.'
+                : 'Discuss the clues with your group. The host will open voting when ready.';
+            discussionStatus.style.display = '';
+        } else if (isVote) {
+            const voted = roomData.votedCount || 0;
+            const total = roomData.totalCount || 0;
+            discussionStatus.textContent = `Voting — ${voted} / ${total} voted`;
+            discussionStatus.style.display = '';
+        } else {
+            discussionStatus.style.display = 'none';
         }
-    }, 1000);
+    }
+
+    if (isVote) {
+        // Voting stays open until the round resolves so players can change
+        // their pick freely; the server keeps only their latest vote.
+        voteSelect.disabled = false;
+        btnSubmitVote.disabled = false;
+        voteStatus.textContent = hasVotedThisRound
+            ? 'Vote submitted. You can change your pick until the round resolves.'
+            : '';
+    }
+
+    if (btnOpenVoting) btnOpenVoting.style.display = (isHost && isDiscussion) ? 'inline-flex' : 'none';
+    if (btnResolveRound) {
+        btnResolveRound.style.display = (isHost && isVote) ? 'inline-flex' : 'none';
+        if (isHost && isVote) {
+            const voted = roomData.votedCount || 0;
+            const total = roomData.totalCount || 0;
+            btnResolveRound.textContent = `Resolve Round (${voted} / ${total} voted)`;
+        }
+    }
+    if (btnFinishGame) btnFinishGame.style.display = (isHost && (isDiscussion || isVote)) ? 'inline-flex' : 'none';
 }
 
-btnSkipTimer.addEventListener('click', () => {
-    clearInterval(discussionInterval);
-    socket.emit('skip-timer');
-});
+if (btnOpenVoting) {
+    btnOpenVoting.addEventListener('click', () => {
+        if (!isHost) return;
+        socket.emit('open-voting');
+    });
+}
 
-btnNextRound.addEventListener('click', () => {
-    clearInterval(discussionInterval);
-    socket.emit('next-round');
-});
+if (btnResolveRound) {
+    btnResolveRound.addEventListener('click', () => {
+        if (!isHost) return;
+        const voted = (roomData && roomData.votedCount) || 0;
+        const total = (roomData && roomData.totalCount) || 0;
+        const remaining = Math.max(0, total - voted);
+        const msg = remaining > 0
+            ? `Resolve voting now? ${remaining} player(s) haven't voted — their votes will be skipped.`
+            : 'Resolve voting now?';
+        if (!confirm(msg)) return;
+        socket.emit('resolve-round');
+    });
+}
 
 btnFinishGame.addEventListener('click', () => {
-    clearInterval(discussionInterval);
+    if (!isHost) return;
+    if (!confirm('Reveal the impostor now? This skips voting and ends the game.')) return;
     socket.emit('finish-game');
 });
 
 btnSubmitVote.addEventListener('click', () => {
     const targetId = voteSelect.value;
     if (!targetId) return;
+    if (!roomData || roomData.gameState !== 'vote') return;
     socket.emit('cast-vote', { targetId });
-    voteSelect.disabled = true;
-    btnSubmitVote.disabled = true;
-    voteStatus.textContent = 'Vote submitted. Waiting for others...';
+    hasVotedThisRound = true;
+    voteStatus.textContent = 'Vote submitted. You can change your pick until the round resolves.';
 });
 
 // ═══════════════════════════════════════════
@@ -389,7 +590,6 @@ btnSubmitVote.addEventListener('click', () => {
 // ═══════════════════════════════════════════
 
 function showReveal(data) {
-    clearInterval(discussionInterval);
     showScreen('screen-reveal');
 
     revealWord.textContent = data.word || '';
@@ -430,22 +630,72 @@ btnPlayAgain.addEventListener('click', () => {
 //  SOCKET EVENT HANDLERS
 // ═══════════════════════════════════════════
 
+// On the very first connect after a cold load (refresh, tab restore, shared
+// link), use the URL ?join=CODE deep link plus any persisted localStorage
+// session to walk straight back into the active room. Subsequent reconnects
+// are handled by the dedicated 'reconnect' handler below.
+let initialAutoRejoinAttempted = false;
+function attemptInitialAutoRejoin() {
+    const urlCode = readJoinCodeFromUrl();
+    if (!urlCode) return; // No deep link → stay on the login screen.
+
+    const session = readActiveSession();
+    if (!session || session.code !== urlCode || !session.name) {
+        // Deep link without a matching local session: prefill the code so the
+        // user only has to type their name. Do NOT auto-rejoin under another
+        // identity — that would let strangers reuse the link by guessing.
+        if (inputCode) inputCode.value = urlCode;
+        return;
+    }
+
+    myName = session.name;
+    if (session.rejoinToken) myRejoinToken = session.rejoinToken;
+
+    socket.emit('join-room', {
+        code: urlCode,
+        name: session.name,
+        rejoinToken: session.rejoinToken || undefined,
+    }, (res) => {
+        if (!res || res.error) {
+            // Stale session (server restarted, room expired, etc.) — wipe it,
+            // strip the URL, and fall back to the login screen quietly.
+            clearActiveSession();
+            setUrlJoinCode(null);
+            if (inputCode) inputCode.value = urlCode;
+            if (res && res.error) showError(res.error);
+            return;
+        }
+        if (res.rejoinToken) {
+            myRejoinToken = res.rejoinToken;
+            persistRejoinToken(urlCode, res.rejoinToken);
+            writeActiveSession({ code: urlCode, name: session.name, rejoinToken: res.rejoinToken });
+        }
+        showToast('Welcome back!');
+    });
+}
+
 socket.on('connect', () => {
-    myId = socket.id;
+    setConnectionStatus('connected', 'Connected');
+    if (!initialAutoRejoinAttempted) {
+        initialAutoRejoinAttempted = true;
+        attemptInitialAutoRejoin();
+    }
 });
 
 // Connection lifecycle handlers to make temporary network drops feel smoother,
 // especially on mobile devices where the OS may briefly suspend networking.
 socket.on('connect_error', () => {
+    setConnectionStatus('connecting', 'Connection problem — retrying...');
     showToast('Connection problem — trying to reconnect...');
 });
 
 socket.on('reconnect_attempt', () => {
+    setConnectionStatus('connecting', 'Reconnecting to game...');
     showToast('Reconnecting to game...');
 });
 
 socket.on('reconnect', () => {
-    myId = socket.id;
+    setConnectionStatus('connected', 'Reconnected');
     showToast('Reconnected — restoring your game...');
 
     // If we already know the room and player name, attempt to rejoin
@@ -460,7 +710,24 @@ socket.on('reconnect', () => {
 });
 
 socket.on('reconnect_failed', () => {
+    setConnectionStatus('failed', 'Unable to reconnect — refresh to retry.');
     showError('Unable to reconnect. Please refresh or rejoin.');
+});
+
+socket.on('kicked', () => {
+    // The host removed us from the room. Wipe any persisted session so we
+    // don't auto-rejoin the room we were just removed from, and bounce back
+    // to the login screen with a clear message.
+    clearActiveSession();
+    setUrlJoinCode(null);
+    if (roomData && roomData.code) {
+        safeLocalRemove(REJOIN_STORAGE_PREFIX + roomData.code);
+    }
+    myRejoinToken = null;
+    roomData = null;
+    isHost = false;
+    showScreen('screen-login');
+    showError('You were removed from the room by the host.');
 });
 
 function applyRejoinState(data) {
@@ -489,17 +756,8 @@ function applyRejoinState(data) {
         }
         return;
     }
-    if (gs === 'discussion') {
-        const timerDuration = data.timerDuration || 60;
-        let remaining = timerDuration;
-        if (data.discussionStartedAt != null) {
-            remaining = Math.max(0, Math.ceil((data.discussionStartedAt + timerDuration * 1000 - Date.now()) / 1000));
-        }
-        showEvidenceDiscussion(data.descriptions || [], timerDuration, {
-            remainingSeconds: remaining,
-            totalSeconds: timerDuration,
-            hasVoted: data.hasVoted,
-        });
+    if (gs === 'discussion' || gs === 'vote') {
+        showEvidenceDiscussion(data.descriptions || [], { hasVoted: data.hasVoted });
         return;
     }
     if (gs === 'reveal' && data.reveal) {
@@ -515,12 +773,26 @@ socket.on('rejoin-state', (data) => {
 socket.on('room-created', ({ code, rejoinToken }) => {
     myRejoinToken = rejoinToken || null;
     if (rejoinToken) persistRejoinToken(code, rejoinToken);
+    // Persist this session and add ?join=CODE to the URL so a refresh while
+    // hosting takes the host straight back into the room.
+    writeActiveSession({ code, name: myName, rejoinToken: rejoinToken || null });
+    setUrlJoinCode(code);
     showScreen('screen-lobby');
 });
 
 socket.on('room-update', (data) => {
     roomData = data;
     isHost = data.hostId === myId;
+
+    // Keep the URL / persisted session in sync with the room we're actually
+    // in. This covers the case where the player joined indirectly (rejoin,
+    // auto-rejoin) and we never hit the join button explicitly.
+    if (data && data.code) {
+        setUrlJoinCode(data.code);
+        if (myName) {
+            writeActiveSession({ code: data.code, name: myName, rejoinToken: myRejoinToken });
+        }
+    }
 
     if (data.gameState === 'lobby') {
         renderLobby(data);
@@ -535,6 +807,18 @@ socket.on('room-update', (data) => {
     if (data.gameState === 'description') {
         submitStatus.textContent = `${data.submittedCount} / ${data.totalCount} Submitted`;
     }
+
+    // Refresh host-only override controls (force-advance button text, etc.)
+    updateDescribeHostControls();
+
+    // Refresh evidence/voting controls if we're already on that screen so
+    // hosts immediately see the right action button after a state transition.
+    if (data.gameState === 'discussion' || data.gameState === 'vote') {
+        const currentScreen = document.querySelector('.screen.active');
+        if (currentScreen && currentScreen.id === 'screen-evidence') {
+            updateEvidenceControls();
+        }
+    }
 });
 
 socket.on('game-started', (role) => {
@@ -548,8 +832,19 @@ socket.on('game-started', (role) => {
     showAssignment(role);
 });
 
-socket.on('all-submitted', ({ descriptions, timerDuration }) => {
-    showEvidenceDiscussion(descriptions, timerDuration);
+socket.on('all-submitted', ({ descriptions }) => {
+    hasVotedThisRound = false;
+    showEvidenceDiscussion(descriptions);
+});
+
+socket.on('voting-opened', () => {
+    // Voting was just opened by the host. Clear any per-player vote UI state
+    // so players can submit a fresh vote for this round.
+    hasVotedThisRound = false;
+    if (voteSelect) voteSelect.disabled = false;
+    if (btnSubmitVote) btnSubmitVote.disabled = false;
+    if (voteStatus) voteStatus.textContent = '';
+    updateEvidenceControls();
 });
 
 socket.on('reveal', (data) => {
@@ -559,7 +854,7 @@ socket.on('reveal', (data) => {
 socket.on('back-to-lobby', () => {
     // Reset local state (keep myRejoinToken for rejoin)
     myRole = null;
-    clearInterval(discussionInterval);
+    hasVotedThisRound = false;
 
     // Reset UI elements
     btnSubmitText.disabled = false;
@@ -578,6 +873,43 @@ socket.on('disconnect', (reason) => {
     // For temporary network drops, keep the user on their current screen and
     // let the automatic reconnection logic above handle recovery.
     if (reason !== 'io client disconnect') {
+        setConnectionStatus('connecting', 'Disconnected — reconnecting...');
         showToast('Disconnected — attempting to reconnect...');
+    } else {
+        setConnectionStatus('disconnected', 'Disconnected');
     }
+});
+
+// ═══════════════════════════════════════════
+//  AGGRESSIVE WAKE / NETWORK RECOVERY
+// ═══════════════════════════════════════════
+// Mobile devices often suspend networking when the screen is locked or the
+// tab is backgrounded. Once Socket.IO's pingTimeout (60s by default on the
+// server) is exceeded, the socket is killed and we then have to wait for the
+// next reconnection backoff tick before trying again. These listeners nudge
+// Socket.IO to reconnect immediately the instant the device wakes up or the
+// network comes back, so the user doesn't see a long "reconnecting..." gap.
+
+function nudgeReconnect() {
+    if (!socket.connected) {
+        try { socket.connect(); } catch { /* socket.io handles bad calls */ }
+    }
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) nudgeReconnect();
+});
+
+window.addEventListener('online', () => {
+    showToast('Network back online — reconnecting...');
+    nudgeReconnect();
+});
+
+window.addEventListener('focus', nudgeReconnect);
+
+// On iOS/Android the back-forward cache can restore the page from memory; the
+// `pageshow` event fires with `persisted=true` in that case and we need to
+// re-establish the socket because the underlying TCP/WS connection is gone.
+window.addEventListener('pageshow', (e) => {
+    if (e.persisted) nudgeReconnect();
 });
