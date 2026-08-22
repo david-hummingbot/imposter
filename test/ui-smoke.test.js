@@ -177,7 +177,62 @@ async function waitFor(pred, label, ms = 6000) {
         `landed on ${reached}`);
 
     check('no page errors across the whole flow', pageErrors.length === 0, pageErrors.join(' | '));
-    p2.close(); dom.window.close();
+
+    // ── Reload-and-resume, with the real client's own stored state ──
+    // The highest-risk path in the credential change: resuming a seat now needs
+    // a rejoinToken in the HANDSHAKE, which the client has to have stored and
+    // re-presented. A protocol test cannot catch a client that fails to do that.
+    const carried = {};
+    for (let i = 0; i < w.localStorage.length; i++) {
+        const k = w.localStorage.key(i);
+        carried[k] = w.localStorage.getItem(k);
+    }
+    check('the client stored a rejoin credential to come back with',
+        Object.keys(carried).some(k => k.startsWith('imposter_rejoin_')),
+        JSON.stringify(Object.keys(carried)));
+
+    const roomCode = d.getElementById('lobby-code').textContent.trim();
+    dom.window.close();
+    await sleep(300);
+
+    // Rebuild the page with that localStorage in place, and deliberately WITHOUT
+    // ?join= in the URL — so anything that works must have come from the
+    // server-side resume driven by the handshake credential.
+    const html = await (await fetch(URL)).text();
+    const seed = `<script>${Object.entries(carried)
+        .map(([k, v]) => `localStorage.setItem(${JSON.stringify(k)},${JSON.stringify(v)});`)
+        .join('')}</script>`;
+    const errors2 = [];
+    const vc2 = new VirtualConsole();
+    vc2.on('jsdomError', e => errors2.push(String(e.message || e)));
+    const dom2 = new JSDOM(html.replace('<script src="/socket.io/socket.io.js">', seed + '<script src="/socket.io/socket.io.js">'), {
+        url: URL,
+        runScripts: 'dangerously',
+        resources: {
+            interceptors: [requestInterceptor((request) => {
+                if (!request.url.startsWith(URL)) {
+                    return new Response('', { headers: { 'Content-Type': 'text/css' } });
+                }
+            })],
+        },
+        pretendToBeVisual: true,
+        virtualConsole: vc2,
+    });
+    const w2 = dom2.window, d2 = w2.document;
+    await waitFor(() => w2.io && d2.getElementById('btn-create'), 'reloaded page scripts');
+    const active2 = () => (d2.querySelector('.screen.active') || {}).id;
+    let resumed = false;
+    try {
+        await waitFor(() => active2() === 'screen-reveal' || active2() === 'screen-assignment'
+            || active2() === 'screen-evidence' || active2() === 'screen-lobby', 'resumed into the game', 8000);
+        resumed = true;
+    } catch { /* reported below */ }
+    check('a reloaded page resumes into the game from its stored credential',
+        resumed, `landed on ${active2()} (expected to rejoin room ${roomCode})`);
+    check('the reloaded page has no errors', errors2.length === 0, errors2.join(' | '));
+
+    dom2.window.close();
+    p2.close();
     console.log(`\n${fails === 0 ? '✓ UI SMOKE PASS' : '✗ ' + fails + ' FAILURE(S)'}\n`);
     process.exit(fails ? 1 : 0);
 })().catch(e => { console.error('\nSMOKE ERROR:', e.message); console.error(log.slice(-1500)); process.exit(2); });

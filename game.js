@@ -18,7 +18,14 @@ const { getRandomWord, getRandomWordExcluding } = require('./words');
 // Bump when the snapshot/action wire format changes incompatibly. The client
 // compares against its own constant and asks the user to reload on mismatch,
 // instead of silently misbehaving against a server it doesn't understand.
-const PROTOCOL = 2;
+// 3: the handshake must now carry a rejoinToken to resume a seat.
+const PROTOCOL = 3;
+
+// A room this size is already unplayable as a social game; the cap exists to
+// stop an unauthenticated stranger from making the server do O(n^2) work, since
+// every reconcile builds one snapshot per player and each snapshot lists every
+// player.
+const MAX_PLAYERS_PER_ROOM = Number(process.env.MAX_PLAYERS_PER_ROOM) || 20;
 
 // ─── Presence ───
 // A boolean `connected` is too coarse. iOS closes the WebSocket the moment the
@@ -99,22 +106,49 @@ function createRoom(hostPlayerId, hostName, isCodeTaken) {
 }
 
 function addPlayer(room, playerId, name) {
-    if (room.players.find(p => p.id === playerId)) return false;
-    if (room.gameState !== 'lobby') return false;
+    if (room.players.find(p => p.id === playerId)) return { error: 'You are already in this room.' };
+    if (room.gameState !== 'lobby') return { error: 'Game already in progress.' };
+    if (room.players.length >= MAX_PLAYERS_PER_ROOM) {
+        return { error: `This room is full (${MAX_PLAYERS_PER_ROOM} players max).` };
+    }
     const rejoinToken = generateRejoinToken();
     room.players.push(newPlayer(playerId, name, rejoinToken));
     return { rejoinToken };
 }
 
+/**
+ * Resolve a seat from a rejoinToken.
+ *
+ * SECURITY: the token is the ONLY credential for an existing seat, and it is
+ * never included in a snapshot. `player.id` (the playerId) is broadcast to
+ * everyone in the room so they can be voted for and kicked, so it is a public
+ * identifier and must never be accepted as proof of identity on its own —
+ * otherwise any player could read another's id out of their own snapshot,
+ * reconnect as them, and read their secret word or act in their name.
+ *
+ * Compared in constant time so a token cannot be recovered a byte at a time.
+ */
 function findPlayerByRejoinToken(room, rejoinToken) {
     if (!rejoinToken || typeof rejoinToken !== 'string') return null;
-    return room.players.find(p => p.rejoinToken === rejoinToken) || null;
+    for (const p of room.players) {
+        if (typeof p.rejoinToken !== 'string') continue;
+        if (p.rejoinToken.length !== rejoinToken.length) continue;
+        if (crypto.timingSafeEqual(Buffer.from(p.rejoinToken), Buffer.from(rejoinToken))) return p;
+    }
+    return null;
 }
 
-/** Used when rejoining without a token (e.g. wiped storage) — merge into the disconnected slot instead of adding a duplicate. */
-function findDisconnectedPlayerByName(room, name) {
-    const trimmed = String(name).trim();
-    return room.players.find(p => p.name === trimmed && p.connected === false) || null;
+/**
+ * Authenticate a socket against a seat: the token must match, and it must
+ * belong to the seat the caller claims. Returns the player or null.
+ */
+function authenticate(room, playerId, rejoinToken) {
+    const byToken = findPlayerByRejoinToken(room, rejoinToken);
+    if (!byToken) return null;
+    // A token identifies its own seat; a claimed playerId may disagree after a
+    // storage wipe, in which case the token wins and the seat is rebound.
+    if (playerId && byToken.id !== playerId) return byToken;
+    return byToken;
 }
 
 /** Mark a player present. Their record (votes, clues, host status) is untouched. */
@@ -401,12 +435,13 @@ function buildSnapshot(room, playerId, now = Date.now()) {
 module.exports = {
     PROTOCOL,
     AWAY_GRACE_MS,
+    MAX_PLAYERS_PER_ROOM,
     presenceOf,
     presentPlayers,
     createRoom,
     addPlayer,
     findPlayerByRejoinToken,
-    findDisconnectedPlayerByName,
+    authenticate,
     markOnline,
     markOffline,
     ensureHost,

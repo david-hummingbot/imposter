@@ -125,6 +125,34 @@ docker run -p 8080:8080 -e PORT=8080 impostor-game
 
 ---
 
+## Configuration
+
+All optional; sensible defaults apply.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `PORT` | `3000` | HTTP port |
+| `DATA_DIR` | `./data` | Where room snapshots are written. Point this at a volume so games survive a restart (the Docker image sets `/data`) |
+| `TRUST_PROXY` | unset | Set to the number of proxies in front of the app (usually `1`) when running behind nginx/Caddy/Traefik. Without it every visitor appears to come from the proxy and they share one rate-limit budget. **Do not set it when the port is exposed directly** — trusting `X-Forwarded-For` with no proxy in front lets any client spoof its address and bypass rate limiting |
+| `AWAY_GRACE_MS` | `15000` | How long a dropped player keeps their place before the round moves on without them. Raise for flaky networks |
+| `MAX_PLAYERS_PER_ROOM` | `20` | Hard cap per room |
+| `MAX_ROOMS` | `500` | Server-wide room cap |
+| `MAX_JOINS_PER_IP` | `120` | Join attempts per address per minute |
+| `MAX_CREATE_PER_IP` | `20` | Rooms created per address per minute |
+| `MAX_ACTIONS_PER_IP` | `600` | Game actions per address per minute |
+
+### Notes on exposing this publicly
+
+- A player's seat is held by a `rejoinToken` kept in their browser's
+  `localStorage`. Clearing site data mid-game loses the seat; the host can
+  remove the stale player so they can rejoin under the same name.
+- Game codes are 6 digits. The per-address join limit is what makes that space
+  impractical to enumerate, so `TRUST_PROXY` must be correct behind a proxy or
+  the limit applies to the proxy rather than to callers.
+- There is no account system and no personal data beyond a display name.
+
+---
+
 ## How to Play
 
 1. **Create** or **Join** a game with a 6-character code

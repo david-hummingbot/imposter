@@ -182,20 +182,56 @@ function roomForPlayer(playerId) {
     return room;
 }
 
-// Per-playerId rate limiting (a misbehaving client can no longer reset its
-// limit by churning through socket connections, since playerId is stable).
-const JOIN_RATE_WINDOW_MS = 60 * 1000;
-const MAX_JOINS_PER_WINDOW = 40;
-const MAX_CREATE_PER_WINDOW = 10;
+// ─── Rate limiting ───
+// Keyed on the CLIENT ADDRESS, not on playerId. playerId is chosen by the
+// client, so a per-playerId budget is no budget at all: rotating it walked
+// straight past a "10 rooms per minute" cap, and made the 6-digit code space
+// enumerable at ~400 join attempts/second. The per-playerId counters are kept
+// as a second layer to stop one well-behaved client looping.
+const RATE_WINDOW_MS = 60 * 1000;
+const MAX_JOINS_PER_PLAYER = 40;
+const MAX_CREATE_PER_PLAYER = 10;
+// Generous enough for a household of players all reconnecting at once, tight
+// enough that enumerating a million codes from one address takes days.
+const MAX_JOINS_PER_IP = Number(process.env.MAX_JOINS_PER_IP) || 120;
+const MAX_CREATE_PER_IP = Number(process.env.MAX_CREATE_PER_IP) || 20;
+const MAX_ACTIONS_PER_IP = Number(process.env.MAX_ACTIONS_PER_IP) || 600;
+// Backstop against room-spam exhausting memory, disk and the 6-digit code space.
+const MAX_ROOMS = Number(process.env.MAX_ROOMS) || 500;
+// Keeps a flood of distinct keys from becoming the memory leak it is meant to
+// prevent.
+const MAX_RATE_KEYS = 20000;
+
 const joinAttempts = new Map();
 const createAttempts = new Map();
+const joinAttemptsIp = new Map();
+const createAttemptsIp = new Map();
+const actionAttemptsIp = new Map();
+
+/**
+ * The address to bill this socket against. Behind a proxy every socket appears
+ * to come from the proxy, so X-Forwarded-For is used — but ONLY when the
+ * operator has declared a proxy via TRUST_PROXY, since otherwise any client
+ * could set the header and mint itself a fresh budget.
+ */
+function clientIp(socket) {
+    if (process.env.TRUST_PROXY) {
+        const xff = socket.handshake.headers['x-forwarded-for'];
+        if (xff) {
+            const first = String(xff).split(',')[0].trim();
+            if (first) return first;
+        }
+    }
+    return socket.handshake.address || 'unknown';
+}
 
 function checkRateLimit(map, key, max) {
     if (!key) return true;
     const now = Date.now();
     let record = map.get(key);
     if (!record || now > record.resetAt) {
-        record = { count: 0, resetAt: now + JOIN_RATE_WINDOW_MS };
+        if (!record && map.size >= MAX_RATE_KEYS) return false; // shed load rather than grow
+        record = { count: 0, resetAt: now + RATE_WINDOW_MS };
         map.set(key, record);
     }
     record.count++;
@@ -222,9 +258,16 @@ function rememberNonce(playerId, nonce, result) {
 
 function pruneEphemeral() {
     const now = Date.now();
-    for (const [k, v] of joinAttempts) if (now > v.resetAt) joinAttempts.delete(k);
-    for (const [k, v] of createAttempts) if (now > v.resetAt) createAttempts.delete(k);
+    for (const map of [joinAttempts, createAttempts, joinAttemptsIp, createAttemptsIp, actionAttemptsIp]) {
+        for (const [k, v] of map) if (now > v.resetAt) map.delete(k);
+    }
     for (const [k, v] of seenNonces) if (now - v.at > NONCE_TTL_MS) seenNonces.delete(k);
+    // Nonces are keyed by a client-chosen playerId, so cap the map outright.
+    if (seenNonces.size > MAX_RATE_KEYS) {
+        const excess = seenNonces.size - MAX_RATE_KEYS;
+        let i = 0;
+        for (const k of seenNonces.keys()) { seenNonces.delete(k); if (++i >= excess) break; }
+    }
 }
 
 setInterval(pruneEphemeral, 60 * 1000);
@@ -313,25 +356,46 @@ function presenceFingerprint(room, now) {
     return room.players.map(p => `${p.id}:${game.presenceOf(p, now)}`).join('|');
 }
 
-function bindSocketToPlayer(socket, room) {
-    if (!room || !socket || !socket.playerId) return;
+function bindSocketToPlayer(socket, room, playerId) {
+    if (!room || !socket || !playerId) return;
     if (!room.socketByPlayer) room.socketByPlayer = {};
-    room.socketByPlayer[socket.playerId] = socket.id;
+    room.socketByPlayer[playerId] = socket.id;
 }
 
 /**
  * Attach this socket to an existing player record: mark them present, join the
  * channels, and refresh the index.
  */
+/**
+ * Grant this socket the seat. The ONLY place a socket becomes authenticated:
+ * every caller has already proven the seat (a matching rejoinToken, or having
+ * just created the seat itself).
+ */
 function attachPlayer(socket, room, player) {
     game.markOnline(room, player.id);
-    bindSocketToPlayer(socket, room);
+    bindSocketToPlayer(socket, room, player.id);
     socket.join(room.code);
-    // Defensive: if the record's id still differs from this socket's playerId,
-    // join that channel too so per-player snapshots still reach this socket.
-    if (player.id !== socket.playerId) socket.join(player.id);
+    // Per-player snapshots are delivered on this channel, so joining it is what
+    // grants sight of the seat's secrets — hence only after authentication.
+    socket.join(player.id);
+    socket.seatId = player.id;
     playerRooms.set(player.id, room.code);
     room.emptySince = null;
+}
+
+/** Find the room holding a seat with this token (for a client whose stored playerId was lost). */
+function roomForToken(token) {
+    if (!token) return null;
+    for (const room of Object.values(rooms)) {
+        if (game.findPlayerByRejoinToken(room, token)) return room;
+    }
+    return null;
+}
+
+/** The authenticated seat's room, or null if this socket never proved a seat. */
+function authedRoom(socket) {
+    if (!socket.seatId) return null;
+    return roomForPlayer(socket.seatId);
 }
 
 // Rewrite all references from oldPlayerId → newPlayerId in a room. Used by the
@@ -372,7 +436,7 @@ const HOST_ONLY = new Set([
 ]);
 
 function applyAction(room, socket, type, payload) {
-    const playerId = socket.playerId;
+    const playerId = socket.seatId; // the proven seat, never the claimed id
 
     if (HOST_ONLY.has(type) && room.hostId !== playerId) {
         return { ok: false, error: 'Only the host can do that.', code: 'NOT_HOST' };
@@ -475,6 +539,7 @@ function applyAction(room, socket, type, payload) {
         }
 
         case 'leave': {
+            socket.seatId = null;
             // "Leave" has to be real on the server. When it was client-only the
             // record lingered in every threshold, and playerId auto-resume would
             // drag the player straight back in on their next load.
@@ -490,46 +555,68 @@ function applyAction(room, socket, type, payload) {
     }
 }
 
-// ─── Auth: every socket carries its stable playerId via handshake auth. ───
+// ─── Handshake ───
+// Two values arrive from the client and they are NOT equivalent:
+//
+//   playerId    — a public identifier. It appears in every snapshot so players
+//                 can be voted for and kicked. Anyone in the room knows it.
+//                 It is a HINT ONLY and proves nothing.
+//   rejoinToken — the credential. Never included in any snapshot, so only the
+//                 owner has it. Required to occupy an existing seat.
+//
+// Conflating the two is how a player could read another's id out of their own
+// snapshot, reconnect as them, and inherit their secret word or host powers.
 io.use((socket, next) => {
     const auth = socket.handshake?.auth || {};
-    const provided = sanitisePlayerId(auth.playerId);
-    // Lenient: accept any reasonable string the client sent. Generate one
-    // server-side when missing so legacy clients don't break — they just lose
-    // the persistence benefits until they update.
-    socket.playerId = provided || crypto.randomUUID();
+    socket.playerId = sanitisePlayerId(auth.playerId) || crypto.randomUUID();
+    socket.authToken = typeof auth.rejoinToken === 'string' && auth.rejoinToken.length <= 128
+        ? auth.rejoinToken
+        : null;
+    // Set only once a seat has actually been proven. Until then this socket can
+    // create or join a room and nothing else.
+    socket.seatId = null;
     next();
 });
 
 io.on('connection', (socket) => {
-    // Each socket joins a private Socket.IO room named after its playerId so we
-    // can target this player regardless of which socketId they currently hold.
-    socket.join(socket.playerId);
-
+    // NOTE: the socket deliberately does NOT join the channel named after its
+    // playerId here. Snapshots are delivered per player on that channel, so
+    // joining it before the seat is proven would hand the player's secret word
+    // to anyone who guessed their (public) id.
     console.log(`✦ Connected: socket=${socket.id} player=${socket.playerId}${socket.recovered ? ' (recovered)' : ''}`);
 
     // Let the client check it isn't a stale build talking to a newer server.
-    socket.emit('hello', { protocol: game.PROTOCOL, playerId: socket.playerId });
+    socket.emit('hello', { protocol: game.PROTOCOL });
 
     // ────── AUTO-RESUME ──────
-    // If this playerId is still a member of a room, put the socket straight back
-    // into the room and mark the player present — without waiting for the client
-    // to re-announce itself. This is the core reconnect fix: it works even for
-    // clients running stale JS, and it closes the window where a reconnected
-    // socket was "connected" yet invisible to the game.
-    const resumed = roomForPlayer(socket.playerId);
-    if (resumed) {
-        const player = resumed.players.find(p => p.id === socket.playerId);
-        attachPlayer(socket, resumed, player);
-        reconcile(resumed);
-        console.log(`✦ ${player.name} auto-resumed room ${resumed.code}`);
+    // Put a returning socket straight back into its room without waiting for the
+    // client to re-announce itself — the reconnect fix that makes a locked phone
+    // recoverable. Gated on the handshake credential: the token must match the
+    // seat, so a stranger replaying a known playerId gets nothing.
+    if (socket.authToken) {
+        const resumed = roomForPlayer(socket.playerId)
+            || roomForToken(socket.authToken);
+        const player = resumed ? game.authenticate(resumed, socket.playerId, socket.authToken) : null;
+        if (player) {
+            if (player.id !== socket.playerId) rewritePlayerId(resumed, player.id, socket.playerId);
+            attachPlayer(socket, resumed, player);
+            reconcile(resumed);
+            console.log(`✦ ${player.name} auto-resumed room ${resumed.code}`);
+        } else if (resumed) {
+            console.log(`✦ Rejected resume for player=${socket.playerId} (bad or missing token)`);
+        }
     }
 
     // ────── CREATE ROOM ──────
     socket.on('create-room', ({ name } = {}, callback) => {
         const cb = typeof callback === 'function' ? callback : () => { };
-        if (!checkRateLimit(createAttempts, socket.playerId, MAX_CREATE_PER_WINDOW)) {
+        const ip = clientIp(socket);
+        if (!checkRateLimit(createAttemptsIp, ip, MAX_CREATE_PER_IP)
+            || !checkRateLimit(createAttempts, socket.playerId, MAX_CREATE_PER_PLAYER)) {
             return cb({ error: 'Too many rooms created. Please wait a minute.' });
+        }
+        if (Object.keys(rooms).length >= MAX_ROOMS) {
+            return cb({ error: 'The server is at capacity. Please try again later.' });
         }
         const validated = validateName(name);
         if (validated.error) return cb({ error: validated.error });
@@ -549,7 +636,9 @@ io.on('connection', (socket) => {
     // ────── JOIN ROOM ──────
     socket.on('join-room', ({ code, name, rejoinToken } = {}, callback) => {
         const cb = typeof callback === 'function' ? callback : () => { };
-        if (!checkRateLimit(joinAttempts, socket.playerId, MAX_JOINS_PER_WINDOW)) {
+        const ip = clientIp(socket);
+        if (!checkRateLimit(joinAttemptsIp, ip, MAX_JOINS_PER_IP)
+            || !checkRateLimit(joinAttempts, socket.playerId, MAX_JOINS_PER_PLAYER)) {
             return cb({ error: 'Too many join attempts. Please wait a minute.' });
         }
         const validated = validateJoinRoom(code, name);
@@ -558,50 +647,38 @@ io.on('connection', (socket) => {
         const room = rooms[validated.code];
         if (!room) return cb({ error: 'Room not found. Check the code and try again.' });
 
-        // 1) Strongest match: rejoinToken (cryptographic, prevents hijacking).
-        const byToken = rejoinToken ? game.findPlayerByRejoinToken(room, rejoinToken) : null;
-        if (byToken) {
-            // Normalise the record onto this socket's stable playerId. Without
-            // this the two can diverge (storage cleared but token kept), and
-            // then per-player snapshots target a channel this socket never
-            // joined while the client's own isHost check compares wrong ids.
-            if (byToken.id !== socket.playerId) rewritePlayerId(room, byToken.id, socket.playerId);
-            attachPlayer(socket, room, byToken);
-            cb({ success: true, rejoined: true, rejoinToken: byToken.rejoinToken });
+        // 1) Returning player: the rejoinToken is the ONLY way back into an
+        //    existing seat. There is deliberately no fallback that matches on
+        //    playerId or name alone — both are broadcast in every snapshot, so
+        //    either one would let anybody in the room take over anybody else's
+        //    seat and read their secret word.
+        const token = rejoinToken || socket.authToken;
+        const seat = token ? game.authenticate(room, socket.playerId, token) : null;
+        if (seat) {
+            // Normalise the seat onto this socket's playerId. Without this the
+            // two can diverge (storage cleared but token kept) and the client's
+            // own isHost check would compare mismatched ids.
+            if (seat.id !== socket.playerId) rewritePlayerId(room, seat.id, socket.playerId);
+            attachPlayer(socket, room, seat);
+            cb({ success: true, rejoined: true, rejoinToken: seat.rejoinToken });
             reconcile(room);
-            console.log(`✦ ${byToken.name} rejoined room ${validated.code} (token)`);
+            console.log(`✦ ${seat.name} rejoined room ${validated.code} (token)`);
             return;
         }
 
-        // 2) Implicit identity match: this stable playerId already has a record.
-        const byPlayerId = room.players.find(p => p.id === socket.playerId);
-        if (byPlayerId) {
-            attachPlayer(socket, room, byPlayerId);
-            cb({ success: true, rejoined: true, rejoinToken: byPlayerId.rejoinToken });
-            reconcile(room);
-            console.log(`✦ ${byPlayerId.name} rejoined room ${validated.code} (playerId)`);
-            return;
+        // 2) Genuinely new player → only allowed in the lobby.
+        if (room.gameState !== 'lobby') {
+            // Distinguish "you've lost your seat" from "you were never in it",
+            // so a player whose storage was wiped gets an honest explanation.
+            const claimed = room.players.some(p => p.name === validated.name);
+            return cb({
+                error: claimed
+                    ? 'That name is taken and this game is already in progress. Ask the host to remove the old player so you can rejoin.'
+                    : 'Game already in progress.',
+            });
         }
-
-        // 3) Name-match fallback: a dropped slot with this exact name. Allowed in
-        //    any state so a player whose storage was wiped can still come back
-        //    mid-game. Their token is rotated and the slot rebound to this
-        //    socket's playerId so future reconnects take the strong path above.
-        const byName = game.findDisconnectedPlayerByName(room, validated.name);
-        if (byName) {
-            if (byName.id !== socket.playerId) rewritePlayerId(room, byName.id, socket.playerId);
-            byName.rejoinToken = crypto.randomUUID();
-            attachPlayer(socket, room, byName);
-            cb({ success: true, rejoined: true, rejoinToken: byName.rejoinToken });
-            reconcile(room);
-            console.log(`✦ ${byName.name} rejoined room ${validated.code} (name fallback)`);
-            return;
-        }
-
-        // 4) Genuinely new player → only allowed in the lobby.
-        if (room.gameState !== 'lobby') return cb({ error: 'Game already in progress.' });
         const result = game.addPlayer(room, socket.playerId, validated.name);
-        if (!result) return cb({ error: 'Could not join room.' });
+        if (result.error) return cb({ error: result.error });
 
         const player = room.players[room.players.length - 1];
         attachPlayer(socket, room, player);
@@ -627,7 +704,15 @@ io.on('connection', (socket) => {
             if (previous) return cb(previous);
         }
 
-        const room = roomForPlayer(socket.playerId);
+        if (!checkRateLimit(actionAttemptsIp, clientIp(socket), MAX_ACTIONS_PER_IP)) {
+            return cb({ ok: false, error: 'Slow down a moment.', code: 'RATE_LIMITED' });
+        }
+
+        // Only a socket that proved its seat may act. Resolving the room from
+        // the *authenticated* seat rather than the claimed playerId is what
+        // stops a stranger who guessed a (public) playerId from voting, kicking
+        // or seizing host.
+        const room = authedRoom(socket);
         if (!room) {
             // Deliberately NOT remembered: the client should be free to retry
             // this once it has rejoined.
@@ -658,17 +743,19 @@ io.on('connection', (socket) => {
 
     // ────── DISCONNECT ──────
     socket.on('disconnect', () => {
-        const room = roomForPlayer(socket.playerId);
+        // An unauthenticated socket never held a seat, so its going away means
+        // nothing — and must not be able to mark someone else away.
+        const room = authedRoom(socket);
         if (!room) return;
 
         // Only mark the player away if THIS socket is the one currently mapped
         // to them. Otherwise opening a second tab would look like the active
         // session dropping.
-        const currentSocketId = room.socketByPlayer && room.socketByPlayer[socket.playerId];
+        const currentSocketId = room.socketByPlayer && room.socketByPlayer[socket.seatId];
         if (currentSocketId && currentSocketId !== socket.id) return;
 
-        game.markOffline(room, socket.playerId);
-        console.log(`✦ Disconnected: socket=${socket.id} player=${socket.playerId}`);
+        game.markOffline(room, socket.seatId);
+        console.log(`✦ Disconnected: socket=${socket.id} player=${socket.seatId}`);
 
         if (!room.players.some(p => p.connected)) {
             if (!room.emptySince) room.emptySince = Date.now();

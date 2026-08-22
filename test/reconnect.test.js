@@ -46,6 +46,10 @@ const child = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')],
         DATA_DIR: dataDir,
         AWAY_GRACE_MS: String(AWAY_MS),
         PRESENCE_TICK_MS: String(TICK_MS),
+        // Small enough that section K can demonstrate the limits without
+        // hammering the server hundreds of times.
+        MAX_JOINS_PER_IP: '100',
+        MAX_CREATE_PER_IP: '15',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -93,10 +97,14 @@ function waitFor(pred, label, timeout = 4000) {
     });
 }
 
-/** A test client. `S` is the latest snapshot, exactly like the real client. */
-function mkClient(playerId) {
+/**
+ * A test client. `S` is the latest snapshot, exactly like the real client.
+ * `token` is the rejoinToken presented in the handshake — the credential the
+ * server requires before putting a socket back into an existing seat.
+ */
+function mkClient(playerId, token) {
     const s = io(URL, {
-        auth: { playerId },
+        auth: { playerId, rejoinToken: token },
         transports: ['websocket'],
         reconnection: false,
         forceNew: true,
@@ -133,28 +141,35 @@ async function room(n, tag) {
     cs.push(host);
     const created = await rpc(host, 'create-room', { name: 'P0' });
     if (!created || !created.code) throw new Error('create failed: ' + JSON.stringify(created));
+    host.token = created.rejoinToken;
     const code = created.code;
     for (let i = 1; i < n; i++) {
         const c = await mkClient(`${tag}-p${i}`);
         cs.push(c);
         const r = await rpc(c, 'join-room', { code, name: `P${i}` });
         if (!r || !r.success) throw new Error(`join failed P${i}: ${JSON.stringify(r)}`);
+        c.token = r.rejoinToken;
     }
-    await waitFor(() => host.S && host.S.players.length === n, 'all joined');
+    await waitFor(() => cs.every(c => c.S && c.S.players.length === n), 'all joined');
     return { cs, host, code };
+}
+
+/** Every client has seen this phase — not just the host. */
+function allAt(cs, phase, label) {
+    return waitFor(() => cs.every(c => c.S && c.S.phase === phase), label || phase);
 }
 
 async function toVote(n, tag) {
     const ctx = await room(n, tag);
     const { cs, host } = ctx;
     await act(host, 'start-game');
-    await waitFor(() => cs.every(c => c.S && c.S.phase === 'assignment'), 'assignment');
+    await allAt(cs, 'assignment');
     for (const c of cs) await act(c, 'continue');
-    await waitFor(() => host.S.phase === 'description', 'description');
+    await allAt(cs, 'description');
     for (const c of cs) await act(c, 'submit-description', { data: `clue-${c.S.you.id.slice(-3)}` });
-    await waitFor(() => host.S.phase === 'discussion', 'discussion');
+    await allAt(cs, 'discussion');
     await act(host, 'open-voting');
-    await waitFor(() => host.S.phase === 'vote', 'vote');
+    await allAt(cs, 'vote');
     return ctx;
 }
 
@@ -171,7 +186,7 @@ try {
     // its reconnect handler was registered on the wrong emitter).
     p2.close();
     await sleep(120);
-    const p2b = await mkClient('A-p2');
+    const p2b = await mkClient('A-p2', p2.token);
     await sleep(SETTLE);
 
     check('reconnected socket receives state unprompted',
@@ -221,7 +236,7 @@ try {
         p0.S.players.some(p => p.presence === 'away'),
         JSON.stringify(p0.S.players.map(p => p.presence)));
 
-    const p2b = await mkClient('C-p2');   // comes straight back
+    const p2b = await mkClient('C-p2', p2.token);   // comes straight back
     await sleep(SETTLE);
     check('they get their vote back after reconnecting inside the window',
         p2b.S && p2b.S.phase === 'vote',
@@ -233,8 +248,10 @@ try {
     const c0 = await mkClient('D-p0');
     const created = await rpc(c0, 'create-room', { name: 'P0' });
     const code = created.code;
+    c0.token = created.rejoinToken;
     const c1 = await mkClient('D-p1');
-    await rpc(c1, 'join-room', { code, name: 'P1' });
+    const j1 = await rpc(c1, 'join-room', { code, name: 'P1' });
+    c1.token = j1.rejoinToken;
     await waitFor(() => c1.S && c1.S.players.length === 2, 'both joined');
     check('creator starts as host', c1.S.players.find(p => p.isHost).id === 'D-p0');
 
@@ -243,7 +260,7 @@ try {
     c0.close();                       // everybody gone
     await sleep(AFTER_AWAY);
 
-    const c1b = await mkClient('D-p1');   // one returns
+    const c1b = await mkClient('D-p1', c1.token);   // one returns
     await sleep(SETTLE);
     check('the returning player becomes host', !!c1b.S && c1b.S.you.isHost,
         `isHost=${c1b.S && c1b.S.you.isHost}`);
@@ -252,7 +269,7 @@ try {
     check('start is refused with only 1 player present',
         !!(refused && !refused.ok), JSON.stringify(refused));
 
-    const c0b = await mkClient('D-p0');
+    const c0b = await mkClient('D-p0', c0.token);
     await sleep(SETTLE);
     const started = await act(c1b, 'start-game');
     check('the new host can actually drive the game', !!(started && started.ok), JSON.stringify(started));
@@ -275,7 +292,7 @@ try {
     check('the leaver is removed, not merely marked offline',
         p0.S.players.length === 2, `players=${p0.S.players.length}`);
 
-    const p2b = await mkClient('E-p2');
+    const p2b = await mkClient('E-p2', p2.token);
     await sleep(SETTLE);
     check('and is not auto-resumed back in on their next load',
         p2b.S === null, JSON.stringify(p2b.S && p2b.S.code));
@@ -287,7 +304,7 @@ try {
     const [p0, p1] = cs;
     p1.close();
     await sleep(120);
-    const p1b = await mkClient('F-p1');
+    const p1b = await mkClient('F-p1', p1.token);
     await sleep(SETTLE);
     const before = p1b.snapshots;
     await act(host, 'finish-game');
@@ -304,9 +321,9 @@ console.log('\n=== G. Retried actions are idempotent ===');
 try {
     const { cs, host } = await room(3, 'G');
     await act(host, 'start-game');
-    await waitFor(() => cs.every(c => c.S && c.S.phase === 'assignment'), 'assignment');
+    await allAt(cs, 'assignment');
     for (const c of cs) await act(c, 'continue');
-    await waitFor(() => host.S.phase === 'description', 'description');
+    await allAt(cs, 'description');
 
     // Same nonce twice — the retry a client makes when it never saw the ack.
     const n = 'fixed-nonce-g';
@@ -334,7 +351,7 @@ try {
     // the whole screen from its first snapshot alone.
     cs[2].close();
     await sleep(120);
-    const fresh = await mkClient('H-p2');
+    const fresh = await mkClient('H-p2', cs[2].token);
     await waitFor(() => fresh.S, 'first snapshot');
     const s = fresh.S;
     const complete = s.phase === 'vote'
@@ -356,7 +373,7 @@ console.log('\n=== I. Roles and words stay scoped to their owner ===');
 try {
     const { cs, host } = await room(3, 'I');
     await act(host, 'start-game');
-    await waitFor(() => cs.every(c => c.S && c.S.phase === 'assignment'), 'assignment');
+    await allAt(cs, 'assignment');
 
     const impostors = cs.filter(c => c.S.you.isImpostor);
     check('exactly one player is told they are the impostor',
@@ -374,15 +391,115 @@ try {
 
     // Once the word is no longer theirs to know, it stops being sent.
     for (const c of cs) await act(c, 'continue');
-    await waitFor(() => host.S.phase === 'description', 'description');
+    await allAt(cs, 'description');
     for (const c of cs) await act(c, 'submit-description', { data: 'x' });
-    await waitFor(() => host.S.phase === 'discussion', 'discussion');
+    await allAt(cs, 'discussion');
     check('the word is withheld once the clue phase is over',
         cs.every(c => c.S.you.word === null && c.S.you.isImpostor === null),
         JSON.stringify(cs.map(c => c.S.you.word)));
     check('and the reveal block is absent before the reveal',
         cs.every(c => c.S.reveal === null), JSON.stringify(cs[0].S.reveal));
 } catch (e) { check('section I ran to completion', false, 'CRASHED: ' + e.message); }
+
+console.log('\n=== J. A public playerId is not a credential ===');
+try {
+    const { cs, code } = await room(3, 'J');
+    const [host, bob, eve] = cs;
+    await act(host, 'start-game');
+    await allAt(cs, 'assignment');
+
+    // Everything below uses ONLY what an ordinary player can read off their own
+    // screen: the other players' ids. These all used to succeed.
+    const publicIds = eve.S.players.map(p => p.id);
+    check('player ids are visible to everyone (so they must not be credentials)',
+        publicIds.includes('J-p1') && publicIds.includes('J-p0'), JSON.stringify(publicIds));
+
+    const bobsWord = bob.S.you.word;
+    const spy = await mkClient('J-p1');            // Bob's id, no token
+    await sleep(SETTLE + 300);
+    check('a socket presenting only a known playerId is NOT resumed into the seat',
+        spy.S === null, JSON.stringify(spy.S && { code: spy.S.code, word: spy.S.you.word }));
+    check("and therefore cannot see the victim's word",
+        !(spy.S && spy.S.you && spy.S.you.word === bobsWord),
+        `spy word=${spy.S && spy.S.you && spy.S.you.word} victim word=${bobsWord}`);
+
+    const forged = await act(spy, 'submit-description', { data: 'forged' });
+    check('an unauthenticated socket cannot act in the victim\'s name',
+        !!(forged && !forged.ok && forged.code === 'NO_ROOM'), JSON.stringify(forged));
+
+    // Host takeover: read hostId off the snapshot and try to use it.
+    const hostId = eve.S.players.find(p => p.isHost).id;
+    const fakeHost = await mkClient(hostId);
+    await sleep(SETTLE + 300);
+    const kick = await act(fakeHost, 'kick', { playerId: 'J-p2' });
+    check('host powers cannot be seized by claiming the host id',
+        !!(kick && !kick.ok), JSON.stringify(kick));
+    await sleep(SETTLE);
+    check('the victim is still in the game',
+        cs[0].S.players.length === 3, `players=${cs[0].S.players.length}`);
+
+    // Joining by name must not hand over a live seat either.
+    bob.close();
+    await sleep(AFTER_AWAY);
+    const thief = await mkClient('J-thief');
+    const byName = await rpc(thief, 'join-room', { code, name: 'P1' });
+    check('a dropped seat cannot be claimed by knowing the (public) name',
+        !!(byName && byName.error), JSON.stringify(byName));
+
+    // The real owner, with the real credential, still gets back in.
+    const realBob = await mkClient('J-p1', bob.token);
+    await sleep(SETTLE + 300);
+    check('the rightful owner still resumes with their token',
+        !!(realBob.S && realBob.S.code === code && realBob.S.you.word === bobsWord),
+        JSON.stringify(realBob.S && { code: realBob.S.code, word: realBob.S.you.word }));
+} catch (e) { check('section J ran to completion', false, 'CRASHED: ' + e.message); }
+
+console.log('\n=== K. A room cannot be flooded with players ===');
+try {
+    // Runs BEFORE the rate-limit section on purpose: that one deliberately
+    // exhausts the per-address join budget, and this needs enough of it left to
+    // reach the cap and be told why.
+    const filler = await mkClient('K-host');
+    const code = (await rpc(filler, 'create-room', { name: 'H' })).code;
+    let joined = 1, refusal = null;
+    for (let i = 0; i < 40; i++) {
+        const s2 = await mkClient(`K-f${i}`);
+        const r = await rpc(s2, 'join-room', { code, name: `f${i}` });
+        s2.close();
+        if (r && r.success) joined++;
+        else { refusal = (r && r.error) || 'no answer'; break; }
+    }
+    check('a room stops accepting players at exactly its cap',
+        joined === 20, `joined=${joined} (cap is 20) refusal=${JSON.stringify(refusal)}`);
+    check('and the refusal says the room is full',
+        /full/i.test(refusal || ''), JSON.stringify(refusal));
+} catch (e) { check('section K ran to completion', false, 'CRASHED: ' + e.message); }
+
+console.log('\n=== L. Limits are not bypassable by rotating a chosen id ===');
+try {
+    // Room-code brute force across rotated playerIds: the budget is keyed on the
+    // address, which the client cannot change.
+    let limited = 0, attempts = 0;
+    for (let i = 0; i < 300 && limited === 0; i++) {
+        const s2 = await mkClient(`bf-${i}`);
+        const r = await rpc(s2, 'join-room', { code: String(200000 + i), name: 'x' });
+        s2.close();
+        attempts++;
+        if (r && /Too many/.test(r.error || '')) limited++;
+    }
+    check('join attempts are rate limited despite a fresh playerId each time',
+        limited > 0, `${attempts} attempts, none limited`);
+
+    let createLimited = 0;
+    for (let i = 0; i < 80 && createLimited === 0; i++) {
+        const s2 = await mkClient(`cr-${i}`);
+        const r = await rpc(s2, 'create-room', { name: 'x' });
+        s2.close();
+        if (r && r.error) createLimited++;
+    }
+    check('room creation is rate limited despite a fresh playerId each time',
+        createLimited > 0, 'created 80 rooms unopposed');
+} catch (e) { check('section L ran to completion', false, 'CRASHED: ' + e.message); }
 
 console.log(`\n${failed === 0 ? '✓ ALL PASS' : '✗ ' + failed + ' FAILURE(S)'} — ${results.length} checks\n`);
 process.exit(failed === 0 ? 0 : 1);

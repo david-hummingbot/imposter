@@ -18,7 +18,7 @@
    ═══════════════════════════════════════════ */
 
 // Must match game.js PROTOCOL. A mismatch means this page is a stale build.
-const PROTOCOL = 2;
+const PROTOCOL = 3;
 
 // ═══════════════════════════════════════════
 //  PERSISTENT SESSION (localStorage)
@@ -67,9 +67,25 @@ function storedRejoinTokenForCode(code) {
     return safeLocalGet(REJOIN_STORAGE_PREFIX + code);
 }
 
+// The object handed to io() as `auth`. Socket.IO re-sends it on every
+// reconnection, so mutating it in place is what lets a token obtained after
+// page load reach the next handshake — and therefore be auto-resumed.
+// Declared here (rather than reaching for `socket.auth` later) because the
+// helpers below run before `socket` is initialised, and touching a const in its
+// temporal dead zone throws even under typeof.
+const handshakeAuth = {
+    playerId: myPlayerId,
+    rejoinToken: undefined,
+};
+
+function setCredential(token) {
+    handshakeAuth.rejoinToken = token || undefined;
+}
+
 function persistRejoinToken(code, token) {
     if (!code || !token) return;
     safeLocalSet(REJOIN_STORAGE_PREFIX + code, token);
+    setCredential(token);
 }
 
 function readActiveSession() {
@@ -99,8 +115,18 @@ function clearActiveSession() {
 // Polling is kept in the transport list on purpose: some carrier proxies and
 // captive portals block or downgrade WebSocket, and being able to fall back
 // means the handshake still succeeds (it silently upgrades when it can).
+// The handshake carries two different things. `playerId` is a public label — it
+// appears in every snapshot so players can be voted for and kicked, and it
+// proves nothing. `rejoinToken` is the credential: it never appears in a
+// snapshot, so only we have it, and the server requires it before putting us
+// back into a seat. Keeping them distinct is what stops another player reading
+// our id off their own screen and reconnecting as us.
+const bootSession = readActiveSession() || {};
+setCredential(bootSession.rejoinToken
+    || (bootSession.code ? storedRejoinTokenForCode(bootSession.code) : null));
+
 const socket = io({
-    auth: { playerId: myPlayerId },
+    auth: handshakeAuth,
     transports: ['websocket', 'polling'],
     upgrade: true,
     reconnection: true,
@@ -695,6 +721,8 @@ btnLeave.addEventListener('click', () => {
     clearActiveSession();
     if (S && S.code) safeLocalRemove(REJOIN_STORAGE_PREFIX + S.code);
     setUrlJoinCode(null);
+    myRejoinToken = null;
+    setCredential(null);
 
     let navigated = false;
     const go = () => {
@@ -840,6 +868,7 @@ socket.on('kicked', () => {
     setUrlJoinCode(null);
     if (S && S.code) safeLocalRemove(REJOIN_STORAGE_PREFIX + S.code);
     myRejoinToken = null;
+    setCredential(null);
     S = null;
     lastV = -1;
     lastCode = null;
