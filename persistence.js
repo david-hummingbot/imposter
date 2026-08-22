@@ -6,7 +6,9 @@ const path = require('path');
 // mappings, transient timers) are stripped before writing and re-initialised
 // on hydrate. Players resume on next reconnect via their saved rejoinToken.
 
-const DATA_DIR = path.join(__dirname, 'data');
+// Overridable so tests (and containers with a mounted volume) can point the
+// snapshot somewhere other than the source tree.
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const TMP_FILE = ROOMS_FILE + '.tmp';
 const MAX_ROOM_AGE_MS = 6 * 60 * 60 * 1000; // 6h
@@ -41,8 +43,17 @@ async function loadRooms() {
             if (now - updatedAt > MAX_ROOM_AGE_MS) continue;
             // Reset runtime fields
             room.socketByPlayer = {};
+            room.v = Number(room.v) || 0;
             if (Array.isArray(room.players)) {
-                room.players.forEach(p => { p.connected = false; });
+                room.players.forEach((p) => {
+                    p.connected = false;
+                    // Preserve lastSeen so presence stays truthful across a
+                    // restart: a quick bounce leaves players `away` (still
+                    // counted, brief grace to come back), while a long outage
+                    // ages them to `offline` so thresholds don't wait on them.
+                    if (typeof p.lastSeen !== 'number') p.lastSeen = 0;
+                    if (typeof p.hasContinued !== 'boolean') p.hasContinued = false;
+                });
             } else {
                 room.players = [];
             }

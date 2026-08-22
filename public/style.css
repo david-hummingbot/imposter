@@ -301,6 +301,40 @@ select {
   background-clip: text;
 }
 
+/* ─── Join QR ─── */
+.qr-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+/* White plate is deliberate: scanners need a light quiet zone, and the rest of
+   the UI is near-black. */
+.qr-img {
+  width: 132px;
+  height: 132px;
+  padding: 6px;
+  border-radius: var(--radius-sm);
+  background: #fff;
+  cursor: pointer;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+  transition: width 0.22s ease, height 0.22s ease;
+}
+
+.qr-img.qr-large {
+  width: 236px;
+  height: 236px;
+}
+
+.qr-hint {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  text-align: center;
+}
+
 /* ─── Player List ─── */
 .player-list {
   list-style: none;
@@ -365,8 +399,27 @@ select {
   flex-shrink: 0;
 }
 
+/* `away` is a dropped player inside the grace window — still counted in every
+   threshold, so it must read as "hang on" rather than "gone". Amber, and only
+   lightly dimmed, vs the flat grey of a genuine `offline`. */
+.player-list li .away-badge {
+  font-size: 0.65rem;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(249, 115, 22, 0.14);
+  flex-shrink: 0;
+}
+
 .player-list li.player-disconnected {
   opacity: 0.55;
+}
+
+.player-list li.player-away {
+  opacity: 0.8;
 }
 
 .player-list li .btn-kick {

@@ -1,23 +1,39 @@
 /* ═══════════════════════════════════════════
    IMPOSTOR GAME — Client Application
+
+   Architecture note (read before editing):
+
+   This client holds NO game state of its own. The server sends whole,
+   self-contained snapshots (`state` events) stamped with a monotonic `v`, and
+   everything on screen is derived from the latest one by render(). There is no
+   event replay to get wrong, so a phone that slept through three phase changes
+   redraws correctly from the first snapshot it receives on waking.
+
+   The only local state is genuinely ephemeral UI: which vote candidate is
+   tapped-but-not-submitted, what is typed in the clue box, whether the QR is
+   enlarged. Anything the server knows about is read from `S`, never cached.
+
+   Actions go out through an acked outbox with retry + idempotency nonces, so
+   the UI never claims something landed before the server confirms it.
    ═══════════════════════════════════════════ */
+
+// Must match game.js PROTOCOL. A mismatch means this page is a stale build.
+const PROTOCOL = 2;
 
 // ═══════════════════════════════════════════
 //  PERSISTENT SESSION (localStorage)
 // ═══════════════════════════════════════════
-// Three-layer persistence so a refresh, tab restore, or cold load can put
-// the player back into their game without having to re-type code/name:
-//   1. A stable `playerId` that lives forever in localStorage and rides the
-//      Socket.IO handshake `auth.playerId`. The server uses it as the
-//      primary identity, so reconnects no longer need to remap socket ids.
-//   2. Per-code rejoin tokens (long-lived; useful even after Leave Game).
-//   3. A single "active session" pointer describing the room the player is
-//      currently in. Combined with the ?join=CODE URL deep link, this lets
-//      the page reload itself straight back into the active game.
+//   1. A stable `playerId` that lives forever and rides the Socket.IO
+//      handshake. The server uses it as primary identity, which is what lets a
+//      reconnecting socket be resumed without the client saying anything.
+//   2. Per-code rejoin tokens (long-lived).
+//   3. An "active session" pointer, combined with the ?join=CODE deep link, so
+//      a cold load walks straight back into the game.
 
 const PLAYER_ID_KEY = 'imposter_player_id_v1';
 const REJOIN_STORAGE_PREFIX = 'imposter_rejoin_';
 const ACTIVE_SESSION_KEY = 'imposter_active_session_v1';
+const RELOAD_GUARD_KEY = 'imposter_protocol_reload';
 
 function safeLocalGet(key) {
     try { return localStorage.getItem(key); } catch { return null; }
@@ -33,44 +49,18 @@ function generateUuid() {
     if (window.crypto && typeof window.crypto.randomUUID === 'function') {
         return window.crypto.randomUUID();
     }
-    // Fallback for older browsers; not RFC4122 but unique enough as an
-    // opaque identifier on the wire.
     return `pid-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function getOrCreatePlayerId() {
     const existing = safeLocalGet(PLAYER_ID_KEY);
-    if (existing && typeof existing === 'string' && /^[A-Za-z0-9_\-]{1,128}$/.test(existing)) {
-        return existing;
-    }
+    if (existing && /^[A-Za-z0-9_\-]{1,128}$/.test(existing)) return existing;
     const fresh = generateUuid();
     safeLocalSet(PLAYER_ID_KEY, fresh);
     return fresh;
 }
 
 const myPlayerId = getOrCreatePlayerId();
-
-// Configure Socket.IO to be more resilient on mobile networks. We allow both
-// WebSocket and HTTP long-polling — some carrier proxies, captive portals and
-// corporate networks block or downgrade WS, and falling back to polling lets
-// the handshake still succeed (the client will silently upgrade to WS when
-// possible). The stable playerId is sent in handshake auth on every (re)
-// connect so the server can identify us without relying on socket.id.
-const socket = io({
-    auth: { playerId: myPlayerId },
-    transports: ['websocket', 'polling'],
-    upgrade: true,
-    reconnection: true,
-    reconnectionAttempts: Infinity,
-    reconnectionDelay: 1000,
-    reconnectionDelayMax: 8000,
-    timeout: 20000,
-});
-
-// ─── State ───
-let myId = myPlayerId; // alias: the stable identity the server sees us as
-let myName = '';
-let myRejoinToken = null; // Cryptographic token; preferred over playerId match
 
 function storedRejoinTokenForCode(code) {
     if (!code) return null;
@@ -104,11 +94,41 @@ function clearActiveSession() {
 }
 
 // ═══════════════════════════════════════════
+//  SOCKET
+// ═══════════════════════════════════════════
+// Polling is kept in the transport list on purpose: some carrier proxies and
+// captive portals block or downgrade WebSocket, and being able to fall back
+// means the handshake still succeeds (it silently upgrades when it can).
+const socket = io({
+    auth: { playerId: myPlayerId },
+    transports: ['websocket', 'polling'],
+    upgrade: true,
+    reconnection: true,
+    reconnectionAttempts: Infinity,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 8000,
+    timeout: 20000,
+});
+
+// ═══════════════════════════════════════════
+//  AUTHORITATIVE STATE
+// ═══════════════════════════════════════════
+
+let S = null;            // latest snapshot — the single source of truth
+let lastV = -1;
+let lastCode = null;
+let myRejoinToken = null;
+let myName = '';
+
+// ─── Ephemeral UI state (deliberately not derived from S) ───
+let voteSelection = null;      // tapped, not yet submitted
+let uiPhaseKey = null;         // `${phase}:${round}` — for "just entered" detection
+let continueUnlockAt = 0;      // role-card reading delay
+let continueTimer = null;
+
+// ═══════════════════════════════════════════
 //  URL DEEP LINK ( ?join=CODE )
 // ═══════════════════════════════════════════
-// Mirrors the reference implementation: while a player is in a room, the
-// game code lives in the URL so any reload, deep-link share, or browser
-// "restore tab" lands the player straight back into that room.
 
 function readJoinCodeFromUrl() {
     try {
@@ -129,46 +149,34 @@ function setUrlJoinCode(code) {
     } catch { /* ignore */ }
 }
 
-let roomData = null;
-let isHost = false;
-let myRole = null; // { isImpostor, word }
-let hasVotedThisRound = false;
-let selectedVoteTargetId = null;
-/** Descriptions from the current round — used to show clues next to each name when voting. */
-let lastEvidenceDescriptions = [];
-
 // ─── DOM Refs ───
 const screens = document.querySelectorAll('.screen');
 
-// Login
 const inputName = document.getElementById('input-name');
 const inputCode = document.getElementById('input-code');
 const btnCreate = document.getElementById('btn-create');
 const btnJoin = document.getElementById('btn-join');
 const loginError = document.getElementById('login-error');
 
-// Lobby
 const lobbyCode = document.getElementById('lobby-code');
 const lobbyPlayers = document.getElementById('lobby-players');
 const hostControls = document.getElementById('host-controls');
 const btnStart = document.getElementById('btn-start');
 const btnLeave = document.getElementById('btn-leave');
+const lobbyQr = document.getElementById('lobby-qr');
+const lobbyQrImg = document.getElementById('lobby-qr-img');
 
-// Assignment
 const assignContent = document.getElementById('assign-content');
 const btnContinue = document.getElementById('btn-continue');
 
-// Description
 const inputDescription = document.getElementById('input-description');
 const btnSubmitText = document.getElementById('btn-submit-text');
 const submitStatus = document.getElementById('submit-status');
 const describeHostActions = document.getElementById('describe-host-actions');
 const btnForceAdvance = document.getElementById('btn-force-advance');
 
-// Evidence
 const evidenceWaiting = document.getElementById('evidence-waiting');
 const evidenceDiscussion = document.getElementById('evidence-discussion');
-const evidenceCounter = document.getElementById('evidence-counter');
 const evidenceList = document.getElementById('evidence-list');
 const discussionStatus = document.getElementById('discussion-status');
 const votePanel = document.getElementById('vote-panel');
@@ -179,7 +187,6 @@ const voteCandidates = document.getElementById('vote-candidates');
 const btnSubmitVote = document.getElementById('btn-submit-vote');
 const voteStatus = document.getElementById('vote-status');
 
-// Reveal
 const revealWord = document.getElementById('reveal-word');
 const revealImpostor = document.getElementById('reveal-impostor');
 const revealDescriptions = document.getElementById('reveal-descriptions');
@@ -187,7 +194,7 @@ const btnPlayAgain = document.getElementById('btn-play-again');
 
 const toastEl = document.getElementById('toast');
 
-// ─── XSS: Escape user content before inserting into HTML ───
+// ─── XSS: escape user content before inserting into HTML ───
 function escapeHtml(str) {
     if (str == null || typeof str !== 'string') return '';
     const div = document.createElement('div');
@@ -195,13 +202,11 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 
-// ─── Avatar Palette ───
 const COLORS = [
     '#a855f7', '#f97316', '#22c55e', '#3b82f6',
     '#ec4899', '#14b8a6', '#eab308', '#ef4444',
     '#6366f1', '#06b6d4', '#8b5cf6', '#f43f5e',
 ];
-
 function getAvatarColor(index) {
     return COLORS[index % COLORS.length];
 }
@@ -211,17 +216,29 @@ function showToast(message) {
     toastEl.textContent = message;
     toastEl.classList.add('visible');
     clearTimeout(toastEl._hide);
-    toastEl._hide = setTimeout(() => {
-        toastEl.classList.remove('visible');
-    }, 3000);
+    toastEl._hide = setTimeout(() => toastEl.classList.remove('visible'), 3000);
 }
 
-// ═══════════════════════════════════════════
-//  CONNECTION STATUS PIP
-// ═══════════════════════════════════════════
-// Persistent visual indicator so players always know whether the live
-// connection is healthy, retrying, or fully failed. Driven by the Socket.IO
-// lifecycle handlers below.
+function showError(msg) {
+    if (!loginError) return;
+    loginError.textContent = msg;
+    loginError.style.animation = 'none';
+    void loginError.offsetWidth;
+    loginError.style.animation = 'fadeSlideUp 0.3s ease';
+}
+
+/**
+ * Surface a problem wherever the player is currently looking. The login screen
+ * has a dedicated error slot; everywhere else a toast is the only thing they'll
+ * actually see.
+ */
+function reportProblem(msg) {
+    if (!msg) return;
+    if (!S) showError(msg);
+    else showToast(msg);
+}
+
+// ─── Connection status pip ───
 const connectionStatusEl = document.getElementById('connection-status');
 function setConnectionStatus(state, label) {
     if (!connectionStatusEl) return;
@@ -232,15 +249,24 @@ function setConnectionStatus(state, label) {
     if (labelEl && label) labelEl.textContent = label;
 }
 
-// ═══════════════════════════════════════════
-//  SCREEN NAVIGATION
-// ═══════════════════════════════════════════
+// ─── Rebuild a list only when its contents actually changed ───
+// Snapshots arrive whenever anything moves (including presence ageing), and
+// blowing away innerHTML every time would restart every CSS entry animation and
+// drop the pressed state off whatever the player was touching.
+function renderIfChanged(el, sig, build) {
+    if (!el) return false;
+    if (el.dataset.sig === sig) return false;
+    el.dataset.sig = sig;
+    el.innerHTML = '';
+    build();
+    return true;
+}
 
 function showScreen(id) {
-    screens.forEach(s => s.classList.remove('active'));
     const target = document.getElementById(id);
+    if (!target || target.classList.contains('active')) return;
+    screens.forEach(s => s.classList.remove('active'));
     target.classList.add('active');
-    // Re-trigger fade-in
     const card = target.querySelector('.card');
     if (card) {
         card.classList.remove('fade-in');
@@ -250,14 +276,394 @@ function showScreen(id) {
 }
 
 // ═══════════════════════════════════════════
-//  LOGIN SCREEN
+//  OUTBOX — acked actions with retry + idempotency
+// ═══════════════════════════════════════════
+// Every mutating command goes through here. Each carries a nonce so a retry is
+// a no-op server-side, which means we can retry freely without risking a
+// double-submitted clue. Nothing is reported to the player as done until the
+// server acks it — the old client optimistically printed "Vote submitted" and
+// could be flatly wrong about it.
+
+const ACTION_TIMEOUT_MS = 8000;
+const OUTBOX_RETRY_MS = 2000;
+const MAX_TRIES = 6;
+
+let outbox = [];
+
+function newNonce() {
+    return generateUuid().replace(/-/g, '').slice(0, 32);
+}
+
+/** Types currently awaiting an ack — used to show "sending…" affordances. */
+function pending(type) {
+    return outbox.some(i => i.type === type);
+}
+
+function sendAction(type, payload) {
+    outbox.push({ nonce: newNonce(), type, payload: payload || {}, tries: 0, inFlight: false });
+    render();
+    flushOutbox();
+}
+
+function settleAction(item, res) {
+    const idx = outbox.indexOf(item);
+
+    // No ack at all (timeout, or dropped while the socket died): keep it queued.
+    if (!res) {
+        item.inFlight = false;
+        if (item.tries >= MAX_TRIES) {
+            if (idx !== -1) outbox.splice(idx, 1);
+            reportProblem('Could not reach the game. Please try that again.');
+            render();
+        }
+        return;
+    }
+
+    // The server doesn't know us yet (fresh socket mid-rejoin). Re-announce and
+    // let the retry loop have another go.
+    if (res.code === 'NO_ROOM') {
+        item.inFlight = false;
+        resyncAfterReconnect();
+        if (item.tries >= MAX_TRIES) {
+            if (idx !== -1) outbox.splice(idx, 1);
+            reportProblem('Lost your place in the game. Try rejoining.');
+            render();
+        }
+        return;
+    }
+
+    if (idx !== -1) outbox.splice(idx, 1);
+
+    // ALREADY_SUBMITTED is the idempotent outcome of a retry that actually did
+    // land the first time — not something to bother the player about.
+    if (!res.ok && res.code !== 'ALREADY_SUBMITTED') {
+        reportProblem(res.error || 'That did not work.');
+    }
+    render();
+}
+
+function flushOutbox() {
+    if (!socket.connected) return;
+    for (const item of outbox.slice()) {
+        if (item.inFlight) continue;
+        item.inFlight = true;
+        item.tries++;
+        const payload = Object.assign({ type: item.type, nonce: item.nonce }, item.payload);
+        socket.timeout(ACTION_TIMEOUT_MS).emit('action', payload, (err, res) => {
+            settleAction(item, err ? null : res);
+        });
+    }
+}
+
+setInterval(() => { if (outbox.length) flushOutbox(); }, OUTBOX_RETRY_MS);
+
+// ═══════════════════════════════════════════
+//  RENDER
+// ═══════════════════════════════════════════
+
+function screenFor(snap) {
+    switch (snap.phase) {
+        case 'lobby': return 'screen-lobby';
+        case 'assignment': return 'screen-assignment';
+        case 'description':
+            // Don't yank someone off their word before they've acknowledged it,
+            // even though the room has already moved on.
+            return (snap.you && snap.you.hasContinued) ? 'screen-describe' : 'screen-assignment';
+        case 'discussion':
+        case 'vote': return 'screen-evidence';
+        case 'reveal': return 'screen-reveal';
+        default: return 'screen-lobby';
+    }
+}
+
+function render() {
+    if (!S || !S.you) return;
+
+    const key = `${S.phase}:${S.round}`;
+    if (key !== uiPhaseKey) {
+        uiPhaseKey = key;
+        onEnterPhase();
+    }
+
+    showScreen(screenFor(S));
+
+    switch (S.phase) {
+        case 'lobby': renderLobby(); break;
+        case 'assignment': renderAssignment(); break;
+        case 'description':
+            if (S.you.hasContinued) renderDescribe(); else renderAssignment();
+            break;
+        case 'discussion':
+        case 'vote': renderEvidence(); break;
+        case 'reveal': renderReveal(); break;
+    }
+}
+
+/** Reset the ephemeral bits that belong to a specific phase+round. */
+function onEnterPhase() {
+    voteSelection = null;
+    if (inputDescription) {
+        inputDescription.value = '';
+        inputDescription.disabled = false;
+    }
+    if (voteStatus) voteStatus.textContent = '';
+
+    if (S.phase === 'assignment' || S.phase === 'description') {
+        // Three-second beat so nobody can speed-tap past their own word.
+        continueUnlockAt = Date.now() + 3000;
+        clearTimeout(continueTimer);
+        continueTimer = setTimeout(render, 3050);
+    }
+}
+
+// ─── Lobby ───
+
+function presenceBadge(p) {
+    if (p.presence === 'offline') return '<span class="offline-badge">offline</span>';
+    if (p.presence === 'away') return '<span class="away-badge">away</span>';
+    return '';
+}
+
+function renderLobby() {
+    lobbyCode.textContent = S.code;
+    updateLobbyQr(S.code);
+
+    const sig = S.players.map(p => `${p.id}:${p.name}:${p.presence}:${p.isHost}`).join('|')
+        + `|host=${S.you.isHost}`;
+    renderIfChanged(lobbyPlayers, sig, () => {
+        S.players.forEach((p, i) => {
+            const li = document.createElement('li');
+            li.style.animationDelay = `${i * 0.06}s`;
+            if (p.presence === 'offline') li.classList.add('player-disconnected');
+            else if (p.presence === 'away') li.classList.add('player-away');
+            const safeName = escapeHtml(p.name);
+            const initial = escapeHtml((p.name || '').charAt(0).toUpperCase()) || '?';
+            const kickBtn = (S.you.isHost && p.id !== S.you.id)
+                ? `<button class="btn-kick" data-player-id="${escapeHtml(p.id)}" aria-label="Remove ${safeName}" title="Remove ${safeName}">✕</button>`
+                : '';
+            li.innerHTML = `
+      <span class="player-avatar" style="background:${getAvatarColor(i)}">${initial}</span>
+      <span class="player-name">${safeName}</span>
+      ${p.isHost ? '<span class="host-badge">Host</span>' : ''}
+      ${presenceBadge(p)}
+      ${kickBtn}
+    `;
+            lobbyPlayers.appendChild(li);
+        });
+    });
+
+    hostControls.style.display = S.you.isHost ? 'flex' : 'none';
+    if (btnStart) {
+        const starting = pending('start-game');
+        btnStart.disabled = starting || S.counts.present < 2;
+        btnStart.textContent = starting ? 'Starting…'
+            : (S.counts.present < 2 ? 'Waiting for players…' : 'Start Game');
+    }
+}
+
+// The server renders the QR from the Host header of the request, so the encoded
+// join URL always matches the origin this browser is on — localhost, LAN IP or
+// tunnel — without the server needing to know its own external address.
+function updateLobbyQr(code) {
+    if (!lobbyQr || !lobbyQrImg) return;
+    if (!code) { lobbyQr.style.display = 'none'; return; }
+    const src = `/qr/${encodeURIComponent(code)}`;
+    if (lobbyQrImg.getAttribute('src') !== src) {
+        lobbyQrImg.setAttribute('src', src);
+        lobbyQrImg.classList.remove('qr-large');
+    }
+    lobbyQr.style.display = 'flex';
+}
+
+// ─── Assignment ───
+
+function renderAssignment() {
+    const extraRound = (S.round || 1) > 1;
+    // Identical copy and styling for everyone, so the impostor can't be spotted
+    // from the shape of their own UI.
+    const sig = `${S.round}:${S.you.word || ''}`;
+    if (assignContent.dataset.sig !== sig) {
+        assignContent.dataset.sig = sig;
+        assignContent.innerHTML = `
+      <p class="role-label">${extraRound ? 'Same word — add another clue!' : 'The secret word is'}</p>
+      <div class="word-display civilian">${escapeHtml(S.you.word || '')}</div>
+      <p class="hint">${extraRound ? 'Give one more descriptive clue.' : 'Describe it without being too obvious!'}</p>
+    `;
+    }
+    const waiting = Math.max(0, continueUnlockAt - Date.now());
+    btnContinue.disabled = waiting > 0 || pending('continue');
+    btnContinue.textContent = pending('continue') ? 'Continuing…' : 'Continue';
+}
+
+// ─── Describe ───
+
+function renderDescribe() {
+    const sending = pending('submit-description');
+    const submitted = S.you.hasSubmitted;
+
+    inputDescription.disabled = submitted || sending;
+    btnSubmitText.disabled = submitted || sending;
+    btnSubmitText.textContent = submitted ? 'Submitted ✓' : (sending ? 'Sending…' : 'Submit');
+
+    submitStatus.textContent = `${S.counts.submitted} / ${S.counts.present} submitted`;
+
+    if (describeHostActions && btnForceAdvance) {
+        describeHostActions.style.display = S.you.isHost ? 'flex' : 'none';
+        const forcing = pending('force-discussion');
+        btnForceAdvance.disabled = forcing;
+        btnForceAdvance.textContent = forcing
+            ? 'Starting…'
+            : `Force Start Discussion (${S.counts.submitted} / ${S.counts.present} submitted)`;
+    }
+}
+
+// ─── Evidence board (discussion + vote) ───
+
+function cluesSig() {
+    return (S.clues || []).map(c => `${c.playerId}:${c.items.join('~')}`).join('|');
+}
+
+function renderEvidence() {
+    if (evidenceWaiting) evidenceWaiting.style.display = 'none';
+    if (evidenceDiscussion) evidenceDiscussion.style.display = 'flex';
+
+    const isVote = S.phase === 'vote';
+
+    // During voting the selectable cards already show name + clue, so the
+    // read-only list above would just repeat every line.
+    if (evidenceList) {
+        evidenceList.style.display = isVote ? 'none' : '';
+        renderIfChanged(evidenceList, cluesSig(), () => {
+            (S.clues || []).forEach((c, i) => {
+                const li = document.createElement('li');
+                li.style.animationDelay = `${i * 0.08}s`;
+                const parts = c.items.map(t => escapeHtml(String(t))).join(', ');
+                li.innerHTML = `<span class="ev-content"><strong>${escapeHtml(c.playerName)}</strong> — ${parts}</span>`;
+                evidenceList.appendChild(li);
+            });
+        });
+    }
+
+    if (discussionStatus) {
+        discussionStatus.style.display = '';
+        discussionStatus.textContent = isVote
+            ? `Voting — ${S.counts.voted} / ${S.counts.present} voted`
+            : (S.you.isHost
+                ? 'Discuss the clues with your group. Tap Open Voting when ready.'
+                : 'Discuss the clues with your group. The host will open voting when ready.');
+    }
+
+    if (votePanel) {
+        votePanel.style.display = isVote ? 'flex' : 'none';
+        votePanel.style.flexDirection = 'column';
+        votePanel.style.alignItems = 'stretch';
+    }
+    if (isVote) renderVotePanel();
+
+    const isDiscussion = S.phase === 'discussion';
+    if (btnOpenVoting) {
+        btnOpenVoting.style.display = (S.you.isHost && isDiscussion) ? 'inline-flex' : 'none';
+        btnOpenVoting.disabled = pending('open-voting');
+        btnOpenVoting.textContent = pending('open-voting') ? 'Opening…' : 'Open Voting';
+    }
+    if (btnResolveRound) {
+        btnResolveRound.style.display = (S.you.isHost && isVote) ? 'inline-flex' : 'none';
+        btnResolveRound.disabled = pending('resolve-round');
+        btnResolveRound.textContent = pending('resolve-round')
+            ? 'Resolving…'
+            : `Resolve Round (${S.counts.voted} / ${S.counts.present} voted)`;
+    }
+    if (btnFinishGame) {
+        btnFinishGame.style.display = (S.you.isHost && (isDiscussion || isVote)) ? 'inline-flex' : 'none';
+        btnFinishGame.disabled = pending('finish-game');
+    }
+}
+
+function renderVotePanel() {
+    const candidates = S.players.filter(p => p.presence !== 'offline');
+    const clueFor = new Map((S.clues || []).map(c => [c.playerId, c.items]));
+
+    const sig = candidates.map(p => `${p.id}:${p.name}`).join('|') + '#' + cluesSig();
+    renderIfChanged(voteCandidates, sig, () => {
+        candidates.forEach((p, i) => {
+            const items = clueFor.get(p.id);
+            const answer = (items && items.length)
+                ? items.map(t => escapeHtml(String(t))).join(', ')
+                : '<span class="vote-candidate-muted">No clues yet</span>';
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'vote-candidate';
+            btn.dataset.playerId = p.id;
+            btn.setAttribute('role', 'radio');
+            btn.style.animationDelay = `${i * 0.05}s`;
+            btn.innerHTML = `<span class="vote-candidate-text">${escapeHtml(p.name)} — ${answer}</span>`;
+            voteCandidates.appendChild(btn);
+        });
+    });
+
+    // The server's record of our vote wins; a local tap only overrides it until
+    // that tap has been acked.
+    const shown = voteSelection || S.you.votedFor;
+    voteCandidates.querySelectorAll('.vote-candidate').forEach((el) => {
+        const on = el.dataset.playerId === shown;
+        el.classList.toggle('selected', on);
+        el.setAttribute('aria-checked', on ? 'true' : 'false');
+    });
+
+    const sending = pending('cast-vote');
+    const changed = shown && shown !== S.you.votedFor;
+    btnSubmitVote.disabled = sending || !changed;
+    btnSubmitVote.textContent = sending ? 'Sending…' : (S.you.votedFor ? 'Change Vote' : 'Submit Vote');
+
+    // Only claim the vote is in when the SERVER says so.
+    if (voteStatus) {
+        voteStatus.textContent = sending
+            ? 'Sending your vote…'
+            : (S.you.votedFor ? 'Vote submitted. You can change it until the round resolves.' : '');
+    }
+}
+
+// ─── Reveal ───
+
+function renderReveal() {
+    revealWord.textContent = (S.reveal && S.reveal.word) || '';
+    revealImpostor.textContent = (S.reveal && S.reveal.impostorName) || '';
+
+    const impostorId = S.reveal && S.reveal.impostorId;
+    renderIfChanged(revealDescriptions, cluesSig() + '#' + impostorId, () => {
+        (S.clues || []).forEach((c, i) => {
+            const li = document.createElement('li');
+            li.style.animationDelay = `${i * 0.08}s`;
+            if (c.playerId === impostorId) li.classList.add('impostor-highlight');
+            const parts = c.items.map(t => escapeHtml(String(t))).join(', ');
+            li.innerHTML = `<span class="ev-content"><strong>${escapeHtml(c.playerName)}</strong> — ${parts}</span>`;
+            revealDescriptions.appendChild(li);
+        });
+    });
+
+    btnPlayAgain.style.display = S.you.isHost ? 'inline-flex' : 'none';
+    btnPlayAgain.disabled = pending('play-again');
+    btnPlayAgain.textContent = pending('play-again') ? 'Resetting…' : 'Play Again';
+}
+
+// ═══════════════════════════════════════════
+//  USER INTENT → ACTIONS
 // ═══════════════════════════════════════════
 
 btnCreate.addEventListener('click', () => {
     const name = inputName.value.trim();
     if (!name) { showError('Please enter your name.'); return; }
     myName = name;
-    socket.emit('create-room', { name });
+    btnCreate.disabled = true;
+    socket.timeout(ACTION_TIMEOUT_MS).emit('create-room', { name }, (err, res) => {
+        btnCreate.disabled = false;
+        if (err) return showError('Could not reach the game. Please try again.');
+        if (!res || res.error) return showError((res && res.error) || 'Could not create the game.');
+        myRejoinToken = res.rejoinToken || null;
+        persistRejoinToken(res.code, res.rejoinToken);
+        writeActiveSession({ code: res.code, name, rejoinToken: res.rejoinToken });
+        setUrlJoinCode(res.code);
+    });
 });
 
 btnJoin.addEventListener('click', () => {
@@ -266,431 +672,266 @@ btnJoin.addEventListener('click', () => {
     if (!name) { showError('Please enter your name.'); return; }
     if (!/^\d{6}$/.test(code)) { showError('Enter the 6-digit game code.'); return; }
     myName = name;
-    const storedToken = storedRejoinTokenForCode(code);
-    socket.emit('join-room', { code, name, rejoinToken: myRejoinToken || storedToken || undefined }, (res) => {
-        if (res.error) {
-            showError(res.error);
-            return;
-        }
+    btnJoin.disabled = true;
+    const token = myRejoinToken || storedRejoinTokenForCode(code) || undefined;
+    socket.timeout(ACTION_TIMEOUT_MS).emit('join-room', { code, name, rejoinToken: token }, (err, res) => {
+        btnJoin.disabled = false;
+        if (err) return showError('Could not reach the game. Please try again.');
+        if (!res || res.error) return showError((res && res.error) || 'Could not join.');
         if (res.rejoinToken) {
             myRejoinToken = res.rejoinToken;
             persistRejoinToken(code, res.rejoinToken);
         }
-        // Persist this session and bake the code into the URL so a refresh,
-        // tab restore, or shared link puts the player straight back here.
         writeActiveSession({ code, name, rejoinToken: res.rejoinToken || myRejoinToken });
         setUrlJoinCode(code);
-        if (res.rejoined) {
-            loginError.textContent = '';
-            showToast('Reconnecting...');
-        }
+        loginError.textContent = '';
     });
 });
 
-inputName.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') btnCreate.focus();
-});
-
-inputCode.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') btnJoin.click();
-});
-
-function showError(msg) {
-    loginError.textContent = msg;
-    loginError.style.animation = 'none';
-    void loginError.offsetWidth;
-    loginError.style.animation = 'fadeSlideUp 0.3s ease';
-}
-
-// ═══════════════════════════════════════════
-//  LOBBY SCREEN
-// ═══════════════════════════════════════════
+inputName.addEventListener('keydown', (e) => { if (e.key === 'Enter') btnCreate.focus(); });
+inputCode.addEventListener('keydown', (e) => { if (e.key === 'Enter') btnJoin.click(); });
 
 btnLeave.addEventListener('click', () => {
-    // Explicit "Leave" — drop the persistent session so we don't auto-rejoin
-    // the same room on the next load, and clear the deep-link query string.
     clearActiveSession();
+    if (S && S.code) safeLocalRemove(REJOIN_STORAGE_PREFIX + S.code);
     setUrlJoinCode(null);
-    location.href = location.pathname;
+
+    let navigated = false;
+    const go = () => {
+        if (navigated) return;
+        navigated = true;
+        location.href = location.pathname;
+    };
+    // Wait for the ack so the leave lands before we tear the socket down, but
+    // never hang the button on a dead connection.
+    socket.timeout(2000).emit('action', { type: 'leave', nonce: newNonce() }, go);
+    setTimeout(go, 2200);
 });
 
-btnStart.addEventListener('click', () => {
-    socket.emit('start-game');
-});
+btnStart.addEventListener('click', () => { if (S) sendAction('start-game'); });
+btnContinue.addEventListener('click', () => { if (S) sendAction('continue'); });
+btnPlayAgain.addEventListener('click', () => { if (S) sendAction('play-again'); });
 
-function renderLobby(data) {
-    lobbyCode.textContent = data.code;
-    lobbyPlayers.innerHTML = '';
-    isHost = data.hostId === myId;
-
-    data.players.forEach((p, i) => {
-        const li = document.createElement('li');
-        li.style.animationDelay = `${i * 0.06}s`;
-        const safeName = escapeHtml(p.name);
-        const initial = escapeHtml((p.name || '').charAt(0).toUpperCase()) || '?';
-        const isDisconnected = p.connected === false;
-        if (isDisconnected) li.classList.add('player-disconnected');
-        const showKick = isHost && p.id !== myId;
-        const kickBtn = showKick
-            ? `<button class="btn-kick" data-player-id="${escapeHtml(p.id)}" aria-label="Remove ${safeName}" title="Remove ${safeName}">✕</button>`
-            : '';
-        const offlineBadge = isDisconnected ? '<span class="offline-badge">offline</span>' : '';
-        li.innerHTML = `
-      <span class="player-avatar" style="background:${getAvatarColor(i)}">${initial}</span>
-      <span class="player-name">${safeName}</span>
-      ${p.id === data.hostId ? '<span class="host-badge">Host</span>' : ''}
-      ${offlineBadge}
-      ${kickBtn}
-    `;
-        lobbyPlayers.appendChild(li);
-    });
-
-    hostControls.style.display = isHost ? 'flex' : 'none';
-}
-
-// Event delegation: a single click handler on the lobby list dispatches kicks
-// regardless of how many times we re-render the player rows.
-if (lobbyPlayers) {
-    lobbyPlayers.addEventListener('click', (e) => {
-        const btn = e.target.closest('.btn-kick');
-        if (!btn) return;
-        const targetId = btn.dataset.playerId;
-        if (!targetId || !isHost) return;
-        const target = (roomData && roomData.players || []).find(p => p.id === targetId);
-        const targetName = target ? target.name : 'this player';
-        if (!confirm(`Remove ${targetName} from the room? They'll be returned to the login screen.`)) return;
-        socket.emit('kick-player', { playerId: targetId });
-    });
-}
-
-// ═══════════════════════════════════════════
-//  ASSIGNMENT SCREEN
-// ═══════════════════════════════════════════
-
-function showAssignment(role) {
-    myRole = role;
-    const isExtraRound = (role.round || 1) > 1;
-    // Same copy and styling for everyone so the imposter cannot tell from the UI.
-    assignContent.innerHTML = `
-      <p class="role-label">${isExtraRound ? 'Same word — add another clue!' : 'The secret word is'}</p>
-      <div class="word-display civilian">${escapeHtml(role.word || '')}</div>
-      <p class="hint">${isExtraRound ? 'Give one more descriptive clue.' : 'Describe it without being too obvious!'}</p>
-    `;
-
-    btnContinue.disabled = true;
-    showScreen('screen-assignment');
-
-    // 3-second reading delay
-    setTimeout(() => { btnContinue.disabled = false; }, 3000);
-}
-
-btnContinue.addEventListener('click', () => {
-    socket.emit('continue-to-describe');
-    showScreen('screen-describe');
-    submitStatus.textContent = '';
-});
-
-// ═══════════════════════════════════════════
-//  DESCRIPTION SCREEN
-// ═══════════════════════════════════════════
-
-// ─── Text Submit ───
 btnSubmitText.addEventListener('click', () => {
-    const desc = inputDescription.value.trim();
-    if (!desc) return;
-    socket.emit('submit-description', { type: 'text', data: desc });
-    btnSubmitText.disabled = true;
-    btnSubmitText.textContent = 'Submitted ✓';
-    inputDescription.disabled = true;
+    if (!S) return;
+    const data = inputDescription.value.trim();
+    if (!data) return;
+    sendAction('submit-description', { data });
 });
 
-// ─── Host: Force-start discussion ───
-// Lets the host unstick a round when one or more players are disconnected
-// or unable to submit, instead of forcing a full game restart.
 if (btnForceAdvance) {
     btnForceAdvance.addEventListener('click', () => {
-        if (!isHost) return;
-        const submitted = (roomData && roomData.submittedCount) || 0;
-        const total = (roomData && roomData.totalCount) || 0;
-        const remaining = Math.max(0, total - submitted);
+        if (!S) return;
+        const remaining = Math.max(0, S.counts.present - S.counts.submitted);
         const msg = remaining > 0
             ? `Force start discussion now? ${remaining} player(s) haven't submitted — they'll be skipped.`
             : 'Force start discussion now?';
         if (!confirm(msg)) return;
-        socket.emit('force-advance-to-discussion');
+        sendAction('force-discussion');
     });
 }
 
-function updateDescribeHostControls() {
-    if (!describeHostActions || !btnForceAdvance) return;
-    const inDescribe = roomData && roomData.gameState === 'description';
-    if (!isHost || !inDescribe) {
-        describeHostActions.style.display = 'none';
-        return;
-    }
-    describeHostActions.style.display = 'flex';
-    const submitted = roomData.submittedCount || 0;
-    const total = roomData.totalCount || 0;
-    btnForceAdvance.textContent = `Force Start Discussion (${submitted} / ${total} submitted)`;
-}
-
-// ═══════════════════════════════════════════
-//  EVIDENCE BOARD
-// ═══════════════════════════════════════════
-
-function showEvidenceWaiting(data) {
-    showScreen('screen-evidence');
-    evidenceWaiting.style.display = 'flex';
-    evidenceDiscussion.style.display = 'none';
-    updateCounter(data);
-}
-
-function updateCounter(data) {
-    evidenceCounter.textContent = `${data.submittedCount} / ${data.totalCount}`;
-}
-
-// Render the evidence/voting screen. The same screen serves both the
-// "discussion" phase (clues only, no voting) and the "vote" phase (voting
-// panel visible). The host advances between them with the explicit Open
-// Voting / Resolve Round / Force Reveal controls below.
-function showEvidenceDiscussion(descriptions, options) {
-    evidenceWaiting.style.display = 'none';
-    evidenceDiscussion.style.display = 'flex';
-    showScreen('screen-evidence');
-
-    lastEvidenceDescriptions = descriptions || [];
-    renderEvidenceList(lastEvidenceDescriptions);
-
-    const opts = options || {};
-    if (opts.hasVoted != null) hasVotedThisRound = !!opts.hasVoted;
-
-    updateEvidenceControls();
-}
-
-function groupDescriptionsByPlayer(descriptions) {
-    const byPlayer = new Map();
-    (descriptions || []).forEach((d) => {
-        const key = d.playerId;
-        if (!byPlayer.has(key)) {
-            byPlayer.set(key, { name: d.playerName, items: [] });
-        }
-        byPlayer.get(key).items.push({ type: d.type, data: d.data });
-    });
-    return byPlayer;
-}
-
-function renderEvidenceList(descriptions) {
-    const byPlayer = groupDescriptionsByPlayer(descriptions);
-
-    evidenceList.innerHTML = '';
-    let rowIndex = 0;
-    byPlayer.forEach(({ name, items }) => {
-        const parts = items.map((item) => escapeHtml(String(item.data)));
-        const li = document.createElement('li');
-        li.style.animationDelay = `${rowIndex * 0.08}s`;
-        li.innerHTML = `<span class="ev-content"><strong>${escapeHtml(name)}</strong> — ${parts.join(', ')}</span>`;
-        evidenceList.appendChild(li);
-        rowIndex++;
-    });
-}
-
-function populateVoteCandidates(descriptions) {
-    if (!voteCandidates || !roomData || !roomData.players) return;
-
-    const byPlayer = groupDescriptionsByPlayer(descriptions);
-    voteCandidates.innerHTML = '';
-
-    roomData.players.forEach((p, i) => {
-        const entry = byPlayer.get(p.id);
-        let answerHtml;
-        if (entry && entry.items.length) {
-            answerHtml = entry.items.map((item) => escapeHtml(String(item.data))).join(', ');
-        } else {
-            answerHtml = '<span class="vote-candidate-muted">No clues yet</span>';
-        }
-
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'vote-candidate';
-        btn.dataset.playerId = p.id;
-        btn.setAttribute('role', 'radio');
-        btn.setAttribute('aria-checked', 'false');
-        btn.style.animationDelay = `${i * 0.05}s`;
-        // Single line: Name — answer (matches in-person voting card layout)
-        btn.innerHTML = `<span class="vote-candidate-text">${escapeHtml(p.name)} — ${answerHtml}</span>`;
-        btn.addEventListener('click', () => selectVoteCandidate(p.id));
-        voteCandidates.appendChild(btn);
-    });
-
-    syncVoteSelectionUI();
-}
-
-function selectVoteCandidate(playerId) {
-    if (!roomData || roomData.gameState !== 'vote') return;
-    selectedVoteTargetId = playerId;
-    syncVoteSelectionUI();
-}
-
-function syncVoteSelectionUI() {
-    if (!voteCandidates) return;
-    voteCandidates.querySelectorAll('.vote-candidate').forEach((el) => {
-        const id = el.dataset.playerId;
-        const on = id === selectedVoteTargetId;
-        el.classList.toggle('selected', on);
-        el.setAttribute('aria-checked', on ? 'true' : 'false');
-    });
-    if (btnSubmitVote) {
-        btnSubmitVote.disabled = !selectedVoteTargetId;
-    }
-}
-
-// Sync the evidence screen's vote panel + host controls to the current room
-// state. Called on entry and on every room-update while the screen is open.
-function updateEvidenceControls() {
-    if (!roomData) return;
-    const state = roomData.gameState;
-    const isVote = state === 'vote';
-    const isDiscussion = state === 'discussion';
-
-    if (votePanel) {
-        votePanel.style.display = isVote ? 'flex' : 'none';
-        /* Inline flex defaults to row — stack label, hints, candidates, submit vertically */
-        votePanel.style.flexDirection = 'column';
-        votePanel.style.alignItems = 'stretch';
-    }
-    // During voting, the selectable cards include names + clues — hide the
-    // duplicate read-only list above to avoid repeating the same text twice.
-    if (evidenceList) evidenceList.style.display = isVote ? 'none' : '';
-
-    if (discussionStatus) {
-        if (isDiscussion) {
-            discussionStatus.textContent = isHost
-                ? 'Discuss the clues with your group. Tap Open Voting when ready.'
-                : 'Discuss the clues with your group. The host will open voting when ready.';
-            discussionStatus.style.display = '';
-        } else if (isVote) {
-            const voted = roomData.votedCount || 0;
-            const total = roomData.totalCount || 0;
-            discussionStatus.textContent = `Voting — ${voted} / ${total} voted`;
-            discussionStatus.style.display = '';
-        } else {
-            discussionStatus.style.display = 'none';
-        }
-    }
-
-    if (isVote) {
-        populateVoteCandidates(lastEvidenceDescriptions);
-        voteStatus.textContent = hasVotedThisRound
-            ? 'Vote submitted. You can change your pick until the round resolves.'
-            : '';
-    }
-
-    if (btnOpenVoting) btnOpenVoting.style.display = (isHost && isDiscussion) ? 'inline-flex' : 'none';
-    if (btnResolveRound) {
-        btnResolveRound.style.display = (isHost && isVote) ? 'inline-flex' : 'none';
-        if (isHost && isVote) {
-            const voted = roomData.votedCount || 0;
-            const total = roomData.totalCount || 0;
-            btnResolveRound.textContent = `Resolve Round (${voted} / ${total} voted)`;
-        }
-    }
-    if (btnFinishGame) btnFinishGame.style.display = (isHost && (isDiscussion || isVote)) ? 'inline-flex' : 'none';
-}
-
-if (btnOpenVoting) {
-    btnOpenVoting.addEventListener('click', () => {
-        if (!isHost) return;
-        socket.emit('open-voting');
-    });
-}
+if (btnOpenVoting) btnOpenVoting.addEventListener('click', () => { if (S) sendAction('open-voting'); });
 
 if (btnResolveRound) {
     btnResolveRound.addEventListener('click', () => {
-        if (!isHost) return;
-        const voted = (roomData && roomData.votedCount) || 0;
-        const total = (roomData && roomData.totalCount) || 0;
-        const remaining = Math.max(0, total - voted);
+        if (!S) return;
+        const remaining = Math.max(0, S.counts.present - S.counts.voted);
         const msg = remaining > 0
             ? `Resolve voting now? ${remaining} player(s) haven't voted — their votes will be skipped.`
             : 'Resolve voting now?';
         if (!confirm(msg)) return;
-        socket.emit('resolve-round');
+        sendAction('resolve-round');
     });
 }
 
 btnFinishGame.addEventListener('click', () => {
-    if (!isHost) return;
+    if (!S) return;
     if (!confirm('Reveal the impostor now? This skips voting and ends the game.')) return;
-    socket.emit('finish-game');
+    sendAction('finish-game');
+});
+
+voteCandidates.addEventListener('click', (e) => {
+    const btn = e.target.closest('.vote-candidate');
+    if (!btn || !S || S.phase !== 'vote') return;
+    voteSelection = btn.dataset.playerId;
+    render();
 });
 
 btnSubmitVote.addEventListener('click', () => {
-    if (!selectedVoteTargetId) return;
-    if (!roomData || roomData.gameState !== 'vote') return;
-    socket.emit('cast-vote', { targetId: selectedVoteTargetId });
-    hasVotedThisRound = true;
-    voteStatus.textContent = 'Vote submitted. You can change your pick until the round resolves.';
+    const target = voteSelection || (S && S.you.votedFor);
+    if (!target || !S || S.phase !== 'vote') return;
+    sendAction('cast-vote', { targetId: target });
 });
 
-// ═══════════════════════════════════════════
-//  REVEAL SCREEN
-// ═══════════════════════════════════════════
+// Event delegation so kicks keep working across re-renders.
+lobbyPlayers.addEventListener('click', (e) => {
+    const btn = e.target.closest('.btn-kick');
+    if (!btn || !S || !S.you.isHost) return;
+    const targetId = btn.dataset.playerId;
+    const target = S.players.find(p => p.id === targetId);
+    if (!target) return;
+    if (!confirm(`Remove ${target.name} from the room? They'll be returned to the login screen.`)) return;
+    sendAction('kick', { playerId: targetId });
+});
 
-function showReveal(data) {
-    showScreen('screen-reveal');
-
-    revealWord.textContent = data.word || '';
-    revealImpostor.textContent = data.impostor?.name || '';
-
-    // Group descriptions by player (one line per player, impostor row highlighted)
-    const byPlayerReveal = new Map();
-    data.descriptions.forEach((d) => {
-        const key = d.playerId;
-        if (!byPlayerReveal.has(key)) {
-            byPlayerReveal.set(key, { name: d.playerName, items: [] });
-        }
-        byPlayerReveal.get(key).items.push({ type: d.type, data: d.data });
-    });
-
-    revealDescriptions.innerHTML = '';
-    let revIndex = 0;
-    byPlayerReveal.forEach(({ name, items }, playerId) => {
-        const parts = items.map((item) => escapeHtml(String(item.data)));
-        const li = document.createElement('li');
-        li.style.animationDelay = `${revIndex * 0.08}s`;
-        if (playerId === data.impostor.id) {
-            li.classList.add('impostor-highlight');
-        }
-        li.innerHTML = `<span class="ev-content"><strong>${escapeHtml(name)}</strong> — ${parts.join(', ')}</span>`;
-        revealDescriptions.appendChild(li);
-        revIndex++;
-    });
-
-    btnPlayAgain.style.display = isHost ? 'inline-flex' : 'none';
+if (lobbyQrImg) {
+    // A 132px code is awkward to scan off another phone; let the host tap to
+    // blow it up rather than shipping a full modal.
+    lobbyQrImg.addEventListener('click', () => lobbyQrImg.classList.toggle('qr-large'));
+    lobbyQrImg.addEventListener('error', () => { if (lobbyQr) lobbyQr.style.display = 'none'; });
 }
 
-btnPlayAgain.addEventListener('click', () => {
-    socket.emit('play-again');
+// ═══════════════════════════════════════════
+//  SERVER EVENTS
+// ═══════════════════════════════════════════
+
+let staleClientHandled = false;
+function handleStaleClient() {
+    if (staleClientHandled) return;
+    staleClientHandled = true;
+    setConnectionStatus('failed', 'Reload required');
+    showToast('The game was updated — reloading…');
+    // Guard against a reload loop if the server is ever rolled BACK to an older
+    // protocol than this page.
+    let already = false;
+    try { already = sessionStorage.getItem(RELOAD_GUARD_KEY) === '1'; } catch { /* ignore */ }
+    if (already) {
+        showError('This page is out of date. Please hard-refresh to continue.');
+        return;
+    }
+    try { sessionStorage.setItem(RELOAD_GUARD_KEY, '1'); } catch { /* ignore */ }
+    setTimeout(() => location.reload(), 1500);
+}
+
+socket.on('hello', (info) => {
+    if (info && typeof info.protocol === 'number' && info.protocol !== PROTOCOL) {
+        handleStaleClient();
+    }
 });
 
-// ═══════════════════════════════════════════
-//  SOCKET EVENT HANDLERS
-// ═══════════════════════════════════════════
+socket.on('state', (snap) => {
+    if (!snap || typeof snap !== 'object' || !snap.you) return;
+    if (snap.protocol !== PROTOCOL) return handleStaleClient();
 
-// On the very first connect after a cold load (refresh, tab restore, shared
-// link), use the URL ?join=CODE deep link plus any persisted localStorage
-// session to walk straight back into the active room. Subsequent reconnects
-// are handled by the dedicated 'reconnect' handler below.
+    // Version guard: ignore a snapshot older than one we've already applied.
+    // `v` is per-room, so it resets when we move to a different room.
+    if (snap.code !== lastCode) {
+        lastCode = snap.code;
+        lastV = -1;
+    } else if (typeof snap.v === 'number' && snap.v <= lastV) {
+        return;
+    }
+    lastV = typeof snap.v === 'number' ? snap.v : lastV;
+    S = snap;
+
+    // Adopt identity from the server. Matters when we were auto-resumed by
+    // playerId after a cold load with no stored session — otherwise myName
+    // stays empty and the session pointer never gets written.
+    if (S.you.name) myName = S.you.name;
+    setUrlJoinCode(S.code);
+    writeActiveSession({ code: S.code, name: myName, rejoinToken: myRejoinToken });
+
+    render();
+});
+
+socket.on('kicked', () => {
+    clearActiveSession();
+    setUrlJoinCode(null);
+    if (S && S.code) safeLocalRemove(REJOIN_STORAGE_PREFIX + S.code);
+    myRejoinToken = null;
+    S = null;
+    lastV = -1;
+    lastCode = null;
+    uiPhaseKey = null;
+    outbox = [];
+    showScreen('screen-login');
+    showError('You were removed from the room by the host.');
+});
+
+// ─── Connection lifecycle ───
+
 let initialAutoRejoinAttempted = false;
+
+socket.on('connect', () => {
+    setConnectionStatus('connected', 'Connected');
+    if (!initialAutoRejoinAttempted) {
+        initialAutoRejoinAttempted = true;
+        attemptInitialAutoRejoin();
+    } else {
+        // Every subsequent connect is a reconnect. The server also auto-resumes
+        // us by playerId, so this is belt-and-braces.
+        resyncAfterReconnect();
+    }
+    flushOutbox();
+});
+
+socket.on('connect_error', () => {
+    // No toast: reconnection is unlimited, so a flaky mobile connection would
+    // fire one per attempt. The status pip already conveys this.
+    setConnectionStatus('connecting', 'Connection problem — retrying...');
+});
+
+socket.on('disconnect', (reason) => {
+    if (reason !== 'io client disconnect') {
+        setConnectionStatus('connecting', 'Disconnected — reconnecting...');
+    } else {
+        setConnectionStatus('disconnected', 'Disconnected');
+    }
+});
+
+// IMPORTANT: in Socket.IO v3+ these are emitted by the Manager (`socket.io`),
+// NOT by the Socket. Registered on the socket they never fire at all — which is
+// how a reconnected client used to become a zombie: still "connected", unknown
+// to the server, every action dropped.
+socket.io.on('reconnect_attempt', () => {
+    setConnectionStatus('connecting', 'Reconnecting to game...');
+});
+
+socket.io.on('reconnect', () => {
+    setConnectionStatus('connected', 'Reconnected');
+    showToast('Reconnected — restoring your game...');
+});
+
+socket.io.on('reconnect_failed', () => {
+    setConnectionStatus('failed', 'Unable to reconnect — refresh to retry.');
+    reportProblem('Unable to reconnect. Please refresh or rejoin.');
+});
+
+/** Re-announce ourselves after a reconnect. Safe to call repeatedly. */
+function resyncAfterReconnect() {
+    const session = readActiveSession() || {};
+    const code = (S && S.code) || session.code;
+    const name = myName || session.name;
+    if (!code || !name) return;
+    const token = myRejoinToken || storedRejoinTokenForCode(code) || undefined;
+    socket.emit('join-room', { code, name, rejoinToken: token }, (res) => {
+        if (res && res.error) {
+            console.warn('resync join-room rejected:', res.error);
+            return;
+        }
+        if (res && res.rejoinToken) {
+            myRejoinToken = res.rejoinToken;
+            persistRejoinToken(code, res.rejoinToken);
+        }
+    });
+}
+
+/**
+ * Cold load. The server already auto-resumes anyone whose playerId is still in
+ * a room, so this only has to cover the deep-link cases: prefill the code for a
+ * fresh player arriving via QR, and clean up a session pointing at a room that
+ * no longer exists.
+ */
 function attemptInitialAutoRejoin() {
     const urlCode = readJoinCodeFromUrl();
-    if (!urlCode) return; // No deep link → stay on the login screen.
+    if (!urlCode) return;
 
     const session = readActiveSession();
     if (!session || session.code !== urlCode || !session.name) {
-        // Deep link without a matching local session: prefill the code so the
-        // user only has to type their name. Do NOT auto-rejoin under another
-        // identity — that would let strangers reuse the link by guessing.
+        // Deep link without a matching local session — the QR case. Prefill the
+        // code so the player only types their name. Do NOT auto-join under
+        // someone else's identity.
         if (inputCode) inputCode.value = urlCode;
         return;
     }
@@ -704,8 +945,8 @@ function attemptInitialAutoRejoin() {
         rejoinToken: session.rejoinToken || undefined,
     }, (res) => {
         if (!res || res.error) {
-            // Stale session (server restarted, room expired, etc.) — wipe it,
-            // strip the URL, and fall back to the login screen quietly.
+            // Stale session (server restarted, room expired) — wipe it and fall
+            // back to the login screen quietly.
             clearActiveSession();
             setUrlJoinCode(null);
             if (inputCode) inputCode.value = urlCode;
@@ -721,245 +962,25 @@ function attemptInitialAutoRejoin() {
     });
 }
 
-socket.on('connect', () => {
-    setConnectionStatus('connected', 'Connected');
-    if (!initialAutoRejoinAttempted) {
-        initialAutoRejoinAttempted = true;
-        attemptInitialAutoRejoin();
-    }
-});
-
-// Connection lifecycle handlers to make temporary network drops feel smoother,
-// especially on mobile devices where the OS may briefly suspend networking.
-socket.on('connect_error', () => {
-    setConnectionStatus('connecting', 'Connection problem — retrying...');
-    showToast('Connection problem — trying to reconnect...');
-});
-
-socket.on('reconnect_attempt', () => {
-    setConnectionStatus('connecting', 'Reconnecting to game...');
-    showToast('Reconnecting to game...');
-});
-
-socket.on('reconnect', () => {
-    setConnectionStatus('connected', 'Reconnected');
-    showToast('Reconnected — restoring your game...');
-
-    // If we already know the room and player name, attempt to rejoin
-    // automatically so the server can send us the appropriate rejoin state.
-    if (roomData && roomData.code && myName) {
-        const storedToken = storedRejoinTokenForCode(roomData.code);
-        socket.emit('join-room', { code: roomData.code, name: myName, rejoinToken: myRejoinToken || storedToken || undefined }, () => {
-            // The server will either emit a fresh room-update or a rejoin-state
-            // event which our existing handlers already understand.
-        });
-    }
-});
-
-socket.on('reconnect_failed', () => {
-    setConnectionStatus('failed', 'Unable to reconnect — refresh to retry.');
-    showError('Unable to reconnect. Please refresh or rejoin.');
-});
-
-socket.on('kicked', () => {
-    // The host removed us from the room. Wipe any persisted session so we
-    // don't auto-rejoin the room we were just removed from, and bounce back
-    // to the login screen with a clear message.
-    clearActiveSession();
-    setUrlJoinCode(null);
-    if (roomData && roomData.code) {
-        safeLocalRemove(REJOIN_STORAGE_PREFIX + roomData.code);
-    }
-    myRejoinToken = null;
-    roomData = null;
-    isHost = false;
-    showScreen('screen-login');
-    showError('You were removed from the room by the host.');
-});
-
-function applyRejoinState(data) {
-    const gs = data.gameState;
-    if (gs === 'lobby') {
-        showScreen('screen-lobby');
-        return;
-    }
-    if (gs === 'assignment' && data.role) {
-        showAssignment(data.role);
-        return;
-    }
-    if (gs === 'description' && data.role) {
-        myRole = data.role;
-        showScreen('screen-describe');
-        submitStatus.textContent = roomData ? `${roomData.submittedCount} / ${roomData.totalCount} Submitted` : '';
-        if (data.hasSubmitted) {
-            btnSubmitText.disabled = true;
-            btnSubmitText.textContent = 'Submitted ✓';
-            inputDescription.disabled = true;
-        } else {
-            btnSubmitText.disabled = false;
-            btnSubmitText.textContent = 'Submit';
-            inputDescription.disabled = false;
-            inputDescription.value = '';
-        }
-        return;
-    }
-    if (gs === 'discussion' || gs === 'vote') {
-        showEvidenceDiscussion(data.descriptions || [], { hasVoted: data.hasVoted });
-        return;
-    }
-    if (gs === 'reveal' && data.reveal) {
-        showReveal(data.reveal);
-    }
-}
-
-socket.on('rejoin-state', (data) => {
-    applyRejoinState(data);
-    showToast('Reconnected — you can continue.');
-});
-
-socket.on('room-created', ({ code, rejoinToken }) => {
-    myRejoinToken = rejoinToken || null;
-    if (rejoinToken) persistRejoinToken(code, rejoinToken);
-    // Persist this session and add ?join=CODE to the URL so a refresh while
-    // hosting takes the host straight back into the room.
-    writeActiveSession({ code, name: myName, rejoinToken: rejoinToken || null });
-    setUrlJoinCode(code);
-    showScreen('screen-lobby');
-});
-
-socket.on('room-update', (data) => {
-    roomData = data;
-    isHost = data.hostId === myId;
-
-    // Keep the URL / persisted session in sync with the room we're actually
-    // in. This covers the case where the player joined indirectly (rejoin,
-    // auto-rejoin) and we never hit the join button explicitly.
-    if (data && data.code) {
-        setUrlJoinCode(data.code);
-        if (myName) {
-            writeActiveSession({ code: data.code, name: myName, rejoinToken: myRejoinToken });
-        }
-    }
-
-    if (data.gameState === 'lobby') {
-        renderLobby(data);
-        // Ensure we're on lobby screen when in lobby state (for join and play-again)
-        const currentScreen = document.querySelector('.screen.active');
-        if (currentScreen && currentScreen.id === 'screen-login') {
-            showScreen('screen-lobby');
-        }
-    }
-
-    // Update submission counter during description phase
-    if (data.gameState === 'description') {
-        submitStatus.textContent = `${data.submittedCount} / ${data.totalCount} Submitted`;
-    }
-
-    // Refresh host-only override controls (force-advance button text, etc.)
-    updateDescribeHostControls();
-
-    // Refresh evidence/voting controls if we're already on that screen so
-    // hosts immediately see the right action button after a state transition.
-    if (data.gameState === 'discussion' || data.gameState === 'vote') {
-        const currentScreen = document.querySelector('.screen.active');
-        if (currentScreen && currentScreen.id === 'screen-evidence') {
-            updateEvidenceControls();
-        }
-    }
-});
-
-socket.on('game-started', (role) => {
-    // Reset description UI for a fresh round
-    btnSubmitText.disabled = false;
-    btnSubmitText.textContent = 'Submit';
-    inputDescription.disabled = false;
-    inputDescription.value = '';
-    submitStatus.textContent = '';
-    hasVotedThisRound = false;
-    selectedVoteTargetId = null;
-
-    showAssignment(role);
-});
-
-socket.on('all-submitted', ({ descriptions }) => {
-    hasVotedThisRound = false;
-    selectedVoteTargetId = null;
-    showEvidenceDiscussion(descriptions);
-});
-
-socket.on('voting-opened', () => {
-    // Voting was just opened by the host. Clear any per-player vote UI state
-    // so players can submit a fresh vote for this round.
-    hasVotedThisRound = false;
-    selectedVoteTargetId = null;
-    if (voteStatus) voteStatus.textContent = '';
-    updateEvidenceControls();
-});
-
-socket.on('reveal', (data) => {
-    showReveal(data);
-});
-
-socket.on('back-to-lobby', () => {
-    // Reset local state (keep myRejoinToken for rejoin)
-    myRole = null;
-    hasVotedThisRound = false;
-    selectedVoteTargetId = null;
-
-    // Reset UI elements
-    btnSubmitText.disabled = false;
-    btnSubmitText.textContent = 'Submit';
-    inputDescription.disabled = false;
-    inputDescription.value = '';
-
-    showScreen('screen-lobby');
-});
-
-socket.on('error-msg', (msg) => {
-    showError(msg);
-});
-
-socket.on('disconnect', (reason) => {
-    // For temporary network drops, keep the user on their current screen and
-    // let the automatic reconnection logic above handle recovery.
-    if (reason !== 'io client disconnect') {
-        setConnectionStatus('connecting', 'Disconnected — reconnecting...');
-        showToast('Disconnected — attempting to reconnect...');
-    } else {
-        setConnectionStatus('disconnected', 'Disconnected');
-    }
-});
-
 // ═══════════════════════════════════════════
-//  AGGRESSIVE WAKE / NETWORK RECOVERY
+//  WAKE / NETWORK RECOVERY
 // ═══════════════════════════════════════════
-// Mobile devices often suspend networking when the screen is locked or the
-// tab is backgrounded. Once Socket.IO's pingTimeout (60s by default on the
-// server) is exceeded, the socket is killed and we then have to wait for the
-// next reconnection backoff tick before trying again. These listeners nudge
-// Socket.IO to reconnect immediately the instant the device wakes up or the
-// network comes back, so the user doesn't see a long "reconnecting..." gap.
+// Phones suspend networking when the screen locks or the tab is backgrounded.
+// Once the server's pingTimeout is exceeded the socket is killed, and we would
+// otherwise sit through the next backoff tick before retrying. These listeners
+// nudge Socket.IO to reconnect the instant the device wakes.
 
 function nudgeReconnect() {
     if (!socket.connected) {
         try { socket.connect(); } catch { /* socket.io handles bad calls */ }
+    } else {
+        flushOutbox();
     }
 }
 
-document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) nudgeReconnect();
-});
-
-window.addEventListener('online', () => {
-    showToast('Network back online — reconnecting...');
-    nudgeReconnect();
-});
-
+document.addEventListener('visibilitychange', () => { if (!document.hidden) nudgeReconnect(); });
+window.addEventListener('online', () => { showToast('Network back online — reconnecting...'); nudgeReconnect(); });
 window.addEventListener('focus', nudgeReconnect);
-
-// On iOS/Android the back-forward cache can restore the page from memory; the
-// `pageshow` event fires with `persisted=true` in that case and we need to
-// re-establish the socket because the underlying TCP/WS connection is gone.
-window.addEventListener('pageshow', (e) => {
-    if (e.persisted) nudgeReconnect();
-});
+// iOS/Android back-forward cache can restore the page from memory; the socket's
+// underlying connection is gone even though the JS heap survived.
+window.addEventListener('pageshow', (e) => { if (e.persisted) nudgeReconnect(); });
