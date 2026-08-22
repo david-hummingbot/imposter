@@ -6,3 +6,8 @@ npm-debug.log
 .env.*
 *.md
 !README.md
+# Not needed in the image; `data` especially must never be baked in.
+data
+test
+Dockerfile
+docker-compose.yml

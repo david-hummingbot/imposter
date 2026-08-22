@@ -52,6 +52,21 @@ function validateDescription(data) {
 
 const app = express();
 
+// Behind a reverse proxy (nginx, Caddy, Traefik, Render, Fly...) the real client
+// IP arrives in X-Forwarded-For. Without this every visitor looks like the proxy
+// and they all share one rate-limit bucket — and express-rate-limit v7 flags the
+// misconfiguration loudly.
+//
+// Opt-in on purpose: trusting the header with NO proxy in front would let anyone
+// spoof their source IP and sidestep rate limiting entirely. Set TRUST_PROXY to
+// the number of proxies in front of the app (usually 1), or an express
+// trust-proxy expression.
+if (process.env.TRUST_PROXY) {
+    const tp = process.env.TRUST_PROXY.trim();
+    app.set('trust proxy', /^\d+$/.test(tp) ? Number(tp) : tp);
+    console.log(`✦ trust proxy = ${tp}`);
+}
+
 // Security headers
 app.use(helmet({ contentSecurityPolicy: false })); // CSP disabled; adjust if you add inline scripts
 

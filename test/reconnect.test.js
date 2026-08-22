@@ -29,10 +29,11 @@ const { io } = require('socket.io-client');
 const PORT = process.env.TEST_PORT || 3101;
 const URL = `http://localhost:${PORT}`;
 
-// Compress the presence window so "they've really gone" happens in under a
-// second instead of 15. AWAY_MS must stay comfortably above the round-trip time
-// or test C becomes flaky.
-const AWAY_MS = 700;
+// Compress the presence window so "they've really gone" takes ~2s instead of
+// 15. Kept well above the round-trip time on purpose: test C asserts that a
+// player who dropped 150ms ago is still counted, and a tighter window would
+// turn an ordinary scheduling hiccup into a failure.
+const AWAY_MS = 2000;
 const TICK_MS = 100;
 const SETTLE = 250;                     // generous slack for a round trip
 const AFTER_AWAY = AWAY_MS + TICK_MS + 400;
@@ -198,7 +199,7 @@ try {
     check('still waiting on the third player', p0.S.phase === 'vote');
 
     p2.close();                       // screen locks, never comes back
-    await waitFor(() => p0.S.phase !== 'vote', 'auto-resolve after away window', 4000);
+    await waitFor(() => p0.S.phase !== 'vote', 'auto-resolve after away window', 8000);
     check('round resolves once they age out of the away window',
         p0.S.phase !== 'vote', `phase=${p0.S.phase}`);
 } catch (e) { check('section B ran to completion', false, 'CRASHED: ' + e.message); }

@@ -5,7 +5,23 @@ services:
       - "3000:3000"
     environment:
       - PORT=3000
+      # Set to the number of proxies in front of this app (e.g. 1 behind nginx,
+      # Caddy, Traefik, Render, Fly). Without it every visitor looks like the
+      # proxy's IP, so they all share a single rate-limit bucket. Leave unset
+      # when exposing the port directly — trusting the header with no proxy in
+      # front lets anyone spoof their IP.
+      # - TRUST_PROXY=1
+      #
+      # How long a dropped player stays counted before the round moves on
+      # without them (ms). Raise it for flaky networks, lower it for impatient
+      # groups.
+      # - AWAY_GRACE_MS=15000
     volumes:
-      # Mount your custom word list. Create words.json or copy from words.json in the repo.
-      - ./words.json:/app/words.json
+      # Active games survive a restart or redeploy.
+      - impostor-data:/data
+      # Mount your custom word list. Create words.json or copy from the repo.
+      - ./words.json:/app/words.json:ro
     restart: unless-stopped
+
+volumes:
+  impostor-data:

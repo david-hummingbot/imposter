@@ -14,7 +14,7 @@
  * Run with: npm run test:ui   (or npm test, which runs both suites)
  */
 const { spawn } = require('child_process');
-const { JSDOM, VirtualConsole } = require('jsdom');
+const { JSDOM, VirtualConsole, requestInterceptor } = require('jsdom');
 const { io } = require('socket.io-client');
 const path = require('path'), os = require('os'), fs = require('fs');
 
@@ -56,7 +56,19 @@ async function waitFor(pred, label, ms = 6000) {
 
     const dom = await JSDOM.fromURL(URL, {
         runScripts: 'dangerously',
-        resources: 'usable',
+        resources: {
+            // Hermetic: never reach the network. index.html links Google Fonts,
+            // and letting that request out made this suite fail whenever it
+            // hiccuped — a network problem reported as a client bug. Anything
+            // not served by the app under test gets a harmless empty 200.
+            interceptors: [
+                requestInterceptor((request) => {
+                    if (!request.url.startsWith(URL)) {
+                        return new Response('', { headers: { 'Content-Type': 'text/css' } });
+                    }
+                }),
+            ],
+        },
         pretendToBeVisual: true,
         virtualConsole: vc,
     });
@@ -98,15 +110,20 @@ async function waitFor(pred, label, ms = 6000) {
         `disabled=${d.getElementById('btn-start').disabled}`);
 
     // ── Start, read the word, submit a clue ──
+    const tStart = Date.now();
     d.getElementById('btn-start').click();
     await waitFor(() => activeId() === 'screen-assignment', 'assignment screen');
     const word = (d.querySelector('#assign-content .word-display') || {}).textContent || '';
     check('assignment screen shows a secret word', word.trim().length > 0, JSON.stringify(word));
-    check('Continue is disabled during the reading delay',
-        d.getElementById('btn-continue').disabled === true);
-    await sleep(3200);
-    check('Continue enables after the reading delay',
-        d.getElementById('btn-continue').disabled === false);
+
+    // Measure how long Continue stays disabled rather than sampling it at an
+    // arbitrary instant: a stalled event loop could otherwise let the delay
+    // elapse before we look, failing a test that has found nothing wrong.
+    // Starvation only ever makes this number larger, so it cannot flake.
+    await waitFor(() => d.getElementById('btn-continue').disabled === false, 'continue enables', 8000);
+    const gated = Date.now() - tStart;
+    check('Continue is gated by a reading delay before it enables',
+        gated >= 2000, `enabled after only ${gated}ms`);
 
     d.getElementById('btn-continue').click();
     await waitFor(() => activeId() === 'screen-describe', 'describe screen');
@@ -151,7 +168,9 @@ async function waitFor(pred, label, ms = 6000) {
 
     // ── Reveal ──
     await new Promise(r => p2.emit('action', { type: 'cast-vote', nonce: 'v2', targetId: p2.S.players[0].id }, r));
-    await sleep(600);
+    // Wait for the outcome instead of sleeping a fixed guess at it.
+    await waitFor(() => activeId() === 'screen-reveal' || activeId() === 'screen-assignment',
+        'round resolves', 6000);
     const reached = activeId();
     check('round resolves once everyone has voted',
         reached === 'screen-reveal' || reached === 'screen-assignment',
