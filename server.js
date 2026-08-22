@@ -16,12 +16,18 @@ const MAX_PLAYER_ID_LEN = 128;
 const MAX_NONCE_LEN = 64;
 const ROOM_CODE_REGEX = /^\d{6}$/;
 
+// Names that mean something special to a JavaScript object. The maps keyed by
+// playerId are prototype-safe now, but rejecting these outright means a client
+// cannot pick an id whose behaviour differs from every other id.
+const RESERVED_PLAYER_IDS = new Set(['__proto__', 'constructor', 'prototype', 'hasOwnProperty']);
+
 function sanitisePlayerId(raw) {
     if (typeof raw !== 'string') return null;
     const trimmed = raw.trim();
     if (!trimmed || trimmed.length > MAX_PLAYER_ID_LEN) return null;
     // Allow URL-safe characters only — UUIDs, opaque tokens, etc.
     if (!/^[A-Za-z0-9_\-]+$/.test(trimmed)) return null;
+    if (RESERVED_PLAYER_IDS.has(trimmed)) return null;
     return trimmed;
 }
 
@@ -67,8 +73,38 @@ if (process.env.TRUST_PROXY) {
     console.log(`✦ trust proxy = ${tp}`);
 }
 
-// Security headers
-app.use(helmet({ contentSecurityPolicy: false })); // CSP disabled; adjust if you add inline scripts
+// Security headers.
+//
+// The CSP is built per request so connect-src can name this exact origin's
+// WebSocket URL. Hard-coding `ws:` would permit connections to any host, and
+// relying on 'self' alone to cover the ws:// upgrade is subtly browser
+// dependent — naming it is unambiguous.
+//
+// style-src keeps 'unsafe-inline' deliberately: the UI sets style attributes
+// directly (per-player avatar colours, animation delays, show/hide), which CSP
+// counts as inline styles. Style injection is a far smaller problem than script
+// injection, and script-src stays strict.
+app.use(helmet({
+    contentSecurityPolicy: {
+        useDefaults: false,
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+            fontSrc: ["'self'", 'data:', 'https://fonts.gstatic.com'],
+            imgSrc: ["'self'", 'data:'],
+            connectSrc: [
+                "'self'",
+                (req) => `ws://${req.headers.host || ''}`,
+                (req) => `wss://${req.headers.host || ''}`,
+            ],
+            objectSrc: ["'none'"],
+            baseUri: ["'self'"],
+            formAction: ["'self'"],
+            frameAncestors: ["'none'"],
+        },
+    },
+}));
 
 // Rate limit static/HTTP traffic only. The Socket.IO endpoint is deliberately
 // exempt: a group of players behind one NAT (household WiFi) all share a single
@@ -85,6 +121,34 @@ app.use(rateLimit({
 
 const server = http.createServer(app);
 
+// ─── Origin policy ───
+// Browsers always attach an Origin to a WebSocket handshake and a page cannot
+// suppress it, so this is what stops an unrelated site from driving the game (or
+// brute-forcing room codes) through a visitor's browser.
+//
+// A missing Origin is allowed: that means a non-browser client (a native app,
+// curl, the test suite). Such a caller could spoof any Origin anyway, so
+// refusing them would cost compatibility and buy nothing — this check exists
+// specifically to constrain hostile *pages*.
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+    .split(',').map(o => o.trim()).filter(Boolean);
+
+function originAllowed(req) {
+    const origin = req.headers.origin;
+    if (!origin) return true;
+    if (ALLOWED_ORIGINS.length) return ALLOWED_ORIGINS.includes(origin);
+    // Default with no configuration: same origin. Comparing the Origin's host
+    // against the Host header means this just works on localhost, a LAN IP, a
+    // tunnel or a real domain, with nothing to set. Set ALLOWED_ORIGINS when a
+    // proxy rewrites Host, or when the page is served from another host.
+    try {
+        const host = req.headers.host;
+        return !!host && new URL(origin).host === host;
+    } catch {
+        return false;
+    }
+}
+
 // Socket.IO server with lenient heartbeat settings to reduce disconnects on
 // flaky or sleeping mobile connections.
 const io = new Server(server, {
@@ -97,6 +161,13 @@ const io = new Server(server, {
     connectionStateRecovery: {
         maxDisconnectionDuration: 3 * 60 * 1000,
         skipMiddlewares: false, // keep the auth middleware so socket.playerId is set
+    },
+    allowRequest: (req, callback) => {
+        if (!originAllowed(req)) {
+            console.log(`✦ Rejected handshake from origin ${req.headers.origin}`);
+            return callback(null, false);
+        }
+        callback(null, true);
     },
 });
 
@@ -323,9 +394,17 @@ function advancePhases(room, now) {
                 return;
             }
             // Not enough of them fingered the impostor — another round on the
-            // same word. If too few players remain to continue, stay put; the
-            // host still has Force Reveal.
-            if (game.startNextRound(room).error) return;
+            // same word.
+            const next = game.startNextRound(room);
+            if (next.limit) {
+                // Out of rounds: end the game rather than growing the clue list
+                // for ever.
+                room.gameState = 'reveal';
+                return;
+            }
+            // Too few players left to continue: stay put, the host still has
+            // Force Reveal.
+            if (next.error) return;
             continue;
         }
         return;
@@ -358,7 +437,7 @@ function presenceFingerprint(room, now) {
 
 function bindSocketToPlayer(socket, room, playerId) {
     if (!room || !socket || !playerId) return;
-    if (!room.socketByPlayer) room.socketByPlayer = {};
+    if (!room.socketByPlayer) room.socketByPlayer = Object.create(null);
     room.socketByPlayer[playerId] = socket.id;
 }
 
@@ -496,9 +575,14 @@ function applyAction(room, socket, type, payload) {
             const { crewWon } = game.tallyVotes(room);
             if (crewWon) {
                 room.gameState = 'reveal';
-            } else if (game.startNextRound(room).error) {
-                return { ok: false, error: 'Need at least 2 players present to continue.' };
+                return { ok: true };
             }
+            const next = game.startNextRound(room);
+            if (next.limit) {
+                room.gameState = 'reveal';
+                return { ok: true };
+            }
+            if (next.error) return { ok: false, error: next.error };
             return { ok: true };
         }
 
@@ -621,14 +705,15 @@ io.on('connection', (socket) => {
         const validated = validateName(name);
         if (validated.error) return cb({ error: validated.error });
 
-        const room = game.createRoom(socket.playerId, validated.name, (c) => Boolean(rooms[c]));
-        if (!room) return cb({ error: 'Could not allocate a game code. Please try again.' });
+        const created = game.createRoom(socket.playerId, validated.name, (c) => Boolean(rooms[c]));
+        if (!created) return cb({ error: 'Could not allocate a game code. Please try again.' });
 
+        const { room, rejoinToken } = created;
         rooms[room.code] = room;
         indexRoom(room);
-        const player = room.players[0];
-        attachPlayer(socket, room, player);
-        cb({ success: true, code: room.code, rejoinToken: player.rejoinToken });
+        attachPlayer(socket, room, room.players[0]);
+        // The only time the plaintext credential exists: only its hash is kept.
+        cb({ success: true, code: room.code, rejoinToken });
         reconcile(room);
         console.log(`✦ Room ${room.code} created by ${validated.name}`);
     });
@@ -660,7 +745,12 @@ io.on('connection', (socket) => {
             // own isHost check would compare mismatched ids.
             if (seat.id !== socket.playerId) rewritePlayerId(room, seat.id, socket.playerId);
             attachPlayer(socket, room, seat);
-            cb({ success: true, rejoined: true, rejoinToken: seat.rejoinToken });
+            // No token echoed back: only its hash is stored, and the client
+            // just proved it already has the plaintext. Deliberately NOT
+            // rotated on rejoin — a rotation whose ack is lost on a flaky
+            // mobile connection would lock the rightful owner out, which is the
+            // exact failure this whole effort exists to remove.
+            cb({ success: true, rejoined: true });
             reconcile(room);
             console.log(`✦ ${seat.name} rejoined room ${validated.code} (token)`);
             return;

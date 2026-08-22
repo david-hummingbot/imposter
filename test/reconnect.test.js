@@ -25,6 +25,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const { io } = require('socket.io-client');
+const gameMod = require('../game.js');
 
 const PORT = process.env.TEST_PORT || 3101;
 const URL = `http://localhost:${PORT}`;
@@ -475,8 +476,68 @@ try {
         /full/i.test(refusal || ''), JSON.stringify(refusal));
 } catch (e) { check('section K ran to completion', false, 'CRASHED: ' + e.message); }
 
-console.log('\n=== L. Limits are not bypassable by rotating a chosen id ===');
+console.log('\n=== L. Hostile pages, reserved ids, secrets at rest, bounded games ===');
 try {
+    // Origin: a browser always sends it and a page cannot suppress it, so this
+    // is what stops an unrelated site driving the game through a visitor.
+    const foreign = io(URL, {
+        auth: { playerId: 'xo' }, transports: ['websocket'],
+        reconnection: false, forceNew: true,
+        extraHeaders: { Origin: 'https://evil.example' },
+    });
+    clients.push(foreign);
+    const foreignConnected = await new Promise((r) => {
+        foreign.once('connect', () => r(true));
+        foreign.once('connect_error', () => r(false));
+        setTimeout(() => r(false), 2500);
+    });
+    check('a handshake from a foreign Origin is refused', !foreignConnected);
+
+    const sameOrigin = io(URL, {
+        auth: { playerId: 'so' }, transports: ['websocket'],
+        reconnection: false, forceNew: true,
+        extraHeaders: { Origin: URL.replace(/\/$/, '') },
+    });
+    clients.push(sameOrigin);
+    const sameConnected = await new Promise((r) => {
+        sameOrigin.once('connect', () => r(true));
+        sameOrigin.once('connect_error', () => r(false));
+        setTimeout(() => r(false), 2500);
+    });
+    check('a handshake from the same Origin still works', sameConnected);
+
+    // "__proto__" used to be an acceptable id, and landed in plain objects
+    // where writes silently vanish.
+    const proto = await mkClient('__proto__');
+    const pr = await rpc(proto, 'create-room', { name: 'P' });
+    check('a reserved id is not accepted as a playerId',
+        !!(pr && pr.success), JSON.stringify(pr));
+    // It is replaced with a server-generated id rather than rejected outright,
+    // so the client still works — it just cannot choose a dangerous one.
+    await sleep(SETTLE);
+    check('and the seat gets a safe server-assigned id',
+        !!(proto.S && proto.S.you.id !== '__proto__'), `id=${proto.S && proto.S.you.id}`);
+
+    // Snapshots must never carry the credential, in any shape.
+    const { cs } = await room(2, 'M');
+    const blob = JSON.stringify(cs[0].S);
+    check('no snapshot contains a token or hash',
+        !/rejoinToken|TokenHash|[0-9a-f]{64}/.test(blob),
+        blob.slice(0, 200));
+
+    // Games are bounded, so the clue list cannot grow for ever.
+    check('there is a round cap', gameMod.MAX_ROUNDS > 0 && gameMod.MAX_ROUNDS <= 100,
+        String(gameMod.MAX_ROUNDS));
+    const fakeRoom = { round: gameMod.MAX_ROUNDS, players: cs.map(() => ({ connected: true, lastSeen: Date.now() })) };
+    const atLimit = gameMod.startNextRound(fakeRoom);
+    check('starting a round past the cap is refused as a limit, not an error',
+        !!(atLimit && atLimit.limit), JSON.stringify(atLimit));
+} catch (e) { check('section L ran to completion', false, 'CRASHED: ' + e.message); }
+
+console.log('\n=== M. Limits are not bypassable by rotating a chosen id ===');
+try {
+    // Runs LAST on purpose: it deliberately exhausts the per-address join and
+    // create budgets, so anything after it would be starved rather than tested.
     // Room-code brute force across rotated playerIds: the budget is keyed on the
     // address, which the client cannot change.
     let limited = 0, attempts = 0;
@@ -499,7 +560,7 @@ try {
     }
     check('room creation is rate limited despite a fresh playerId each time',
         createLimited > 0, 'created 80 rooms unopposed');
-} catch (e) { check('section L ran to completion', false, 'CRASHED: ' + e.message); }
+} catch (e) { check('section M ran to completion', false, 'CRASHED: ' + e.message); }
 
 console.log(`\n${failed === 0 ? '✓ ALL PASS' : '✗ ' + failed + ' FAILURE(S)'} — ${results.length} checks\n`);
 process.exit(failed === 0 ? 0 : 1);

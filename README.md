@@ -134,8 +134,10 @@ All optional; sensible defaults apply.
 | `PORT` | `3000` | HTTP port |
 | `DATA_DIR` | `./data` | Where room snapshots are written. Point this at a volume so games survive a restart (the Docker image sets `/data`) |
 | `TRUST_PROXY` | unset | Set to the number of proxies in front of the app (usually `1`) when running behind nginx/Caddy/Traefik. Without it every visitor appears to come from the proxy and they share one rate-limit budget. **Do not set it when the port is exposed directly** — trusting `X-Forwarded-For` with no proxy in front lets any client spoof its address and bypass rate limiting |
+| `ALLOWED_ORIGINS` | unset | Comma-separated list of origins permitted to open a socket, e.g. `https://game.example`. Unset means **same-origin only**, computed from the `Host` header — which works unconfigured on localhost, a LAN IP, a tunnel or a real domain. Set it only if a proxy rewrites `Host`, or the page is served from a different host than the API |
 | `AWAY_GRACE_MS` | `15000` | How long a dropped player keeps their place before the round moves on without them. Raise for flaky networks |
 | `MAX_PLAYERS_PER_ROOM` | `20` | Hard cap per room |
+| `MAX_ROUNDS` | `20` | Rounds before a game is forced to the reveal, bounding how far the clue list can grow |
 | `MAX_ROOMS` | `500` | Server-wide room cap |
 | `MAX_JOINS_PER_IP` | `120` | Join attempts per address per minute |
 | `MAX_CREATE_PER_IP` | `20` | Rooms created per address per minute |
@@ -144,8 +146,15 @@ All optional; sensible defaults apply.
 ### Notes on exposing this publicly
 
 - A player's seat is held by a `rejoinToken` kept in their browser's
-  `localStorage`. Clearing site data mid-game loses the seat; the host can
-  remove the stale player so they can rejoin under the same name.
+  `localStorage`. Only a SHA-256 hash of it is stored server-side, so the
+  snapshot file on disk cannot be used to take over a seat. Clearing site data
+  mid-game loses the seat; the host can remove the stale player so they can
+  rejoin under the same name.
+- `players[].id` in a snapshot is a public label used for voting and kicking. It
+  is deliberately **not** a credential — only the token is.
+- Sockets are same-origin by default, so an unrelated page cannot drive a game
+  through a visitor's browser. Requests with no `Origin` at all (native clients,
+  scripts) are allowed, since a hostile *page* cannot suppress that header.
 - Game codes are 6 digits. The per-address join limit is what makes that space
   impractical to enumerate, so `TRUST_PROXY` must be correct behind a proxy or
   the limit applies to the proxy rather than to callers.

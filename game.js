@@ -21,6 +21,11 @@ const { getRandomWord, getRandomWordExcluding } = require('./words');
 // 3: the handshake must now carry a rejoinToken to resume a seat.
 const PROTOCOL = 3;
 
+// A game that has run this long is already over socially; the cap exists so
+// room.descriptions (and the snapshot built from it) cannot grow without bound
+// across rounds, on disk as well as in memory.
+const MAX_ROUNDS = Number(process.env.MAX_ROUNDS) || 20;
+
 // A room this size is already unplayable as a social game; the cap exists to
 // stop an unauthenticated stranger from making the server do O(n^2) work, since
 // every reconcile builds one snapshot per player and each snapshot lists every
@@ -63,11 +68,31 @@ function generateRoomCode() {
     return String(n).padStart(6, '0');
 }
 
-function generateRejoinToken() {
-    return crypto.randomUUID();
+/**
+ * Only a HASH of each seat's token is kept.
+ *
+ * The snapshot file is a plain JSON blob on a volume; storing live credentials
+ * in it means anyone who can read that file (a stray backup, a shared volume, a
+ * debug dump) can take over any seat. The token is a full-entropy UUID, so a
+ * single SHA-256 is the right primitive here — this is a random secret, not a
+ * guessable password, so there is nothing for a slow KDF to buy.
+ *
+ * The plaintext is returned to its owner exactly once, when the seat is
+ * created, and never exists server-side again.
+ */
+function hashToken(token) {
+    return crypto.createHash('sha256').update(String(token)).digest('hex');
 }
 
-function newPlayer(id, name, rejoinToken) {
+/** Mint a fresh credential for a seat, storing only its hash. Returns the plaintext. */
+function issueToken(player) {
+    const token = crypto.randomUUID();
+    player.rejoinTokenHash = hashToken(token);
+    delete player.rejoinToken; // in case an older persisted seat carried one
+    return token;
+}
+
+function newPlayer(id, name) {
     return {
         id,
         name,
@@ -76,11 +101,15 @@ function newPlayer(id, name, rejoinToken) {
         hasContinued: false,
         connected: true,
         lastSeen: Date.now(),
-        rejoinToken,
+        rejoinTokenHash: null,
     };
 }
 
-/** Optional isCodeTaken(code) retries until a free 6-digit code (create flow only). */
+/**
+ * Optional isCodeTaken(code) retries until a free 6-digit code (create flow only).
+ * Returns { room, rejoinToken } — the host's plaintext credential, which is the
+ * only time it exists — or null if no code could be allocated.
+ */
 function createRoom(hostPlayerId, hostName, isCodeTaken) {
     let code = generateRoomCode();
     if (typeof isCodeTaken === 'function') {
@@ -89,20 +118,25 @@ function createRoom(hostPlayerId, hostName, isCodeTaken) {
         }
         if (isCodeTaken(code)) return null;
     }
-    return {
+    const host = newPlayer(hostPlayerId, hostName);
+    const rejoinToken = issueToken(host);
+    const room = {
         code,
         v: 0,
         hostId: hostPlayerId,
-        players: [newPlayer(hostPlayerId, hostName, generateRejoinToken())],
+        players: [host],
         targetWord: null,
         impostorDecoyWord: null,
         gameState: 'lobby',
         descriptions: [],
         round: 0,
         votes: [],
-        socketByPlayer: {},
+        // Prototype-safe: keys are client-supplied playerIds, and "__proto__" on
+        // a normal object silently fails to store instead of creating an entry.
+        socketByPlayer: Object.create(null),
         updatedAt: Date.now(),
     };
+    return { room, rejoinToken };
 }
 
 function addPlayer(room, playerId, name) {
@@ -111,8 +145,9 @@ function addPlayer(room, playerId, name) {
     if (room.players.length >= MAX_PLAYERS_PER_ROOM) {
         return { error: `This room is full (${MAX_PLAYERS_PER_ROOM} players max).` };
     }
-    const rejoinToken = generateRejoinToken();
-    room.players.push(newPlayer(playerId, name, rejoinToken));
+    const player = newPlayer(playerId, name);
+    const rejoinToken = issueToken(player);
+    room.players.push(player);
     return { rejoinToken };
 }
 
@@ -130,10 +165,12 @@ function addPlayer(room, playerId, name) {
  */
 function findPlayerByRejoinToken(room, rejoinToken) {
     if (!rejoinToken || typeof rejoinToken !== 'string') return null;
+    const presented = Buffer.from(hashToken(rejoinToken), 'hex');
     for (const p of room.players) {
-        if (typeof p.rejoinToken !== 'string') continue;
-        if (p.rejoinToken.length !== rejoinToken.length) continue;
-        if (crypto.timingSafeEqual(Buffer.from(p.rejoinToken), Buffer.from(rejoinToken))) return p;
+        if (typeof p.rejoinTokenHash !== 'string' || p.rejoinTokenHash.length !== 64) continue;
+        const stored = Buffer.from(p.rejoinTokenHash, 'hex');
+        if (stored.length !== presented.length) continue;
+        if (crypto.timingSafeEqual(stored, presented)) return p;
     }
     return null;
 }
@@ -252,6 +289,7 @@ function startGame(room) {
 function startNextRound(room) {
     const present = presentPlayers(room);
     if (present.length < 2) return { error: 'Need at least 2 players present to continue.' };
+    if ((room.round || 0) >= MAX_ROUNDS) return { error: 'Round limit reached.', limit: true };
 
     room.players.forEach(p => {
         p.hasSubmitted = false;
@@ -314,6 +352,8 @@ function clearVotes(room) {
 function submitDescription(room, playerId, type, data) {
     const player = room.players.find(p => p.id === playerId);
     if (!player || player.hasSubmitted) return false;
+    // Backstop on total stored clues, independent of the round cap.
+    if (room.descriptions.length >= MAX_PLAYERS_PER_ROOM * MAX_ROUNDS) return false;
 
     player.hasSubmitted = true;
     // Submitting implies they've seen their word.
@@ -355,7 +395,8 @@ function tallyVotes(room, now = Date.now()) {
     const impostor = room.players.find(p => p.isImpostor) || null;
     const present = presentPlayers(room, now);
     const threshold = Math.floor(present.length / 2); // strictly more than half
-    const tally = {};
+    // Prototype-safe: keys are client-supplied playerIds.
+    const tally = Object.create(null);
     (room.votes || []).forEach((v) => {
         tally[v.targetId] = (tally[v.targetId] || 0) + 1;
     });
@@ -436,6 +477,9 @@ module.exports = {
     PROTOCOL,
     AWAY_GRACE_MS,
     MAX_PLAYERS_PER_ROOM,
+    MAX_ROUNDS,
+    hashToken,
+    issueToken,
     presenceOf,
     presentPlayers,
     createRoom,

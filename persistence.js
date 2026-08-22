@@ -1,5 +1,6 @@
 const fs = require('fs/promises');
 const path = require('path');
+const crypto = require('crypto');
 
 // Snapshot persistence so a server restart doesn't wipe active games. We
 // write a single JSON file with all rooms; runtime-only fields (socket
@@ -36,17 +37,28 @@ async function loadRooms() {
             return {};
         }
         const now = Date.now();
-        const result = {};
+        // Prototype-safe: keys come from a file on disk, and a "__proto__" key
+        // there would otherwise reassign this object's prototype instead of
+        // adding an entry.
+        const result = Object.create(null);
         for (const [code, room] of Object.entries(parsed.rooms)) {
             if (!room || typeof room !== 'object') continue;
             const updatedAt = Number(room.updatedAt) || Number(parsed.savedAt) || 0;
             if (now - updatedAt > MAX_ROOM_AGE_MS) continue;
             // Reset runtime fields
-            room.socketByPlayer = {};
+            room.socketByPlayer = Object.create(null);
             room.v = Number(room.v) || 0;
             if (Array.isArray(room.players)) {
                 room.players.forEach((p) => {
                     p.connected = false;
+                    // Upgrade seats written before tokens were hashed, so games
+                    // active across the deploy keep working while the plaintext
+                    // credential stops being kept on disk.
+                    if (typeof p.rejoinToken === 'string' && !p.rejoinTokenHash) {
+                        p.rejoinTokenHash = crypto.createHash('sha256')
+                            .update(p.rejoinToken).digest('hex');
+                    }
+                    delete p.rejoinToken;
                     // Preserve lastSeen so presence stays truthful across a
                     // restart: a quick bounce leaves players `away` (still
                     // counted, brief grace to come back), while a long outage
