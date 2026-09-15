@@ -80,6 +80,10 @@ async function waitFor(pred, label, ms = 6000) {
 
     check('client boots with no page errors', pageErrors.length === 0, pageErrors.join(' | '));
 
+    check('page declares a web app manifest',
+        !!d.querySelector('link[rel="manifest"]'),
+        'missing link rel=manifest');
+
     const activeId = () => (d.querySelector('.screen.active') || {}).id;
     check('starts on the login screen', activeId() === 'screen-login', activeId());
 

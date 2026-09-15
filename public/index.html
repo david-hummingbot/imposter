@@ -2,9 +2,18 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="description" content="Impostor Game – A real-time social deduction word game. Play with friends online!" />
+  <meta name="theme-color" content="#0b0e17" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Impostor" />
   <title>Impostor – Social Deduction Game</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/icons/favicon-32.png" type="image/png" sizes="32x32" />
+  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&display=swap" rel="stylesheet" />
@@ -32,6 +41,12 @@
         <input id="input-code" type="text" placeholder="6-digit code" maxlength="6" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" />
         <button id="btn-join" class="btn btn-secondary">Join</button>
       </div>
+
+      <button id="btn-install" class="btn btn-ghost" type="button" hidden>Install app</button>
+      <p id="ios-install-hint" class="ios-install-hint" hidden>
+        Playing on a phone? Open the share menu and tap <strong>Add to Home Screen</strong>.
+        <button id="btn-dismiss-ios-hint" class="hint-dismiss" type="button">Got it</button>
+      </p>
 
       <p id="login-error" class="error-msg"></p>
     </div>

@@ -33,6 +33,13 @@ A real-time social deduction word game. Players join a game room, one is secretl
    - Navigate to `http://localhost:3000`
    - Share the URL with friends (ensure they're on the same network, or use a tunnel like ngrok for remote play)
 
+**Install as an app (PWA).** On a phone, open the game over HTTPS (or localhost), then:
+
+- **Android Chrome** — the browser may show an install banner, or use the **Install app** button on the login screen.
+- **iOS Safari** — Share → **Add to Home Screen**.
+
+The installed icon launches the game full-screen. It still needs a network connection to a running server; this is not an offline game.
+
 **Development mode** (with auto-reload):
 ```bash
 npm run dev
