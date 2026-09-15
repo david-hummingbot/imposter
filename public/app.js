@@ -829,7 +829,26 @@ function handleStaleClient() {
         return;
     }
     try { sessionStorage.setItem(RELOAD_GUARD_KEY, '1'); } catch { /* ignore */ }
-    setTimeout(() => location.reload(), 1500);
+    setTimeout(() => {
+        bustClientCaches().finally(() => location.reload());
+    }, 1500);
+}
+
+/** Drop a cached shell so a PROTOCOL bump is not fought by the service worker. */
+function bustClientCaches() {
+    const jobs = [];
+    try {
+        if (typeof caches !== 'undefined' && caches.keys) {
+            jobs.push(caches.keys().then((keys) => Promise.all(keys.map((k) => caches.delete(k)))));
+        }
+    } catch { /* ignore */ }
+    try {
+        if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+            jobs.push(navigator.serviceWorker.getRegistrations().then((regs) =>
+                Promise.all(regs.map((r) => r.unregister()))));
+        }
+    } catch { /* ignore */ }
+    return jobs.length ? Promise.all(jobs) : Promise.resolve();
 }
 
 socket.on('hello', (info) => {
@@ -1013,3 +1032,65 @@ window.addEventListener('focus', nudgeReconnect);
 // iOS/Android back-forward cache can restore the page from memory; the socket's
 // underlying connection is gone even though the JS heap survived.
 window.addEventListener('pageshow', (e) => { if (e.persisted) nudgeReconnect(); });
+
+// ═══════════════════════════════════════════
+//  PWA (install + service worker)
+// ═══════════════════════════════════════════
+// The game is live Socket.IO and cannot run offline. The worker only caches a
+// shell so "Add to Home Screen" qualifies, and so a flaky first paint still
+// shows the login card. Socket.IO itself is excluded in sw.js on purpose.
+
+const IOS_HINT_KEY = 'imposter_ios_install_dismissed_v1';
+
+function isStandaloneDisplay() {
+    if (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) return true;
+    if (typeof navigator.standalone === 'boolean' && navigator.standalone) return true;
+    return false;
+}
+
+function isIosDevice() {
+    return /iphone|ipad|ipod/i.test(navigator.userAgent || '')
+        || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
+
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').catch(() => { /* private mode / file:// */ });
+    });
+}
+
+const btnInstall = document.getElementById('btn-install');
+let deferredInstallPrompt = null;
+
+window.addEventListener('beforeinstallprompt', (event) => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+    if (btnInstall && !isStandaloneDisplay()) btnInstall.hidden = false;
+});
+
+if (btnInstall) {
+    btnInstall.addEventListener('click', async () => {
+        if (!deferredInstallPrompt) return;
+        deferredInstallPrompt.prompt();
+        try { await deferredInstallPrompt.userChoice; } catch { /* ignore */ }
+        deferredInstallPrompt = null;
+        btnInstall.hidden = true;
+    });
+}
+
+window.addEventListener('appinstalled', () => {
+    deferredInstallPrompt = null;
+    if (btnInstall) btnInstall.hidden = true;
+});
+
+const iosHint = document.getElementById('ios-install-hint');
+const iosHintDismiss = document.getElementById('btn-dismiss-ios-hint');
+if (iosHint && isIosDevice() && !isStandaloneDisplay() && !safeLocalGet(IOS_HINT_KEY)) {
+    iosHint.hidden = false;
+}
+if (iosHintDismiss) {
+    iosHintDismiss.addEventListener('click', () => {
+        safeLocalSet(IOS_HINT_KEY, '1');
+        if (iosHint) iosHint.hidden = true;
+    });
+}

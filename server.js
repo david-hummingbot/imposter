@@ -171,7 +171,16 @@ const io = new Server(server, {
     },
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), {
+    setHeaders(res, filePath) {
+        // Browsers cache SW scripts aggressively. If this file is stale, installed
+        // clients never pick up a new shell — or worse, keep serving old app.js
+        // after PROTOCOL moves. ETags still let 304s through when nothing changed.
+        if (filePath.endsWith('sw.js')) {
+            res.setHeader('Cache-Control', 'no-cache');
+        }
+    },
+}));
 
 // ─── Join QR code ───
 // Rendered server-side so the page needs no client-side QR library — the game

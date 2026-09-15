@@ -49,7 +49,10 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 20px;
+  padding: max(20px, env(safe-area-inset-top, 0px))
+           max(20px, env(safe-area-inset-right, 0px))
+           max(20px, env(safe-area-inset-bottom, 0px))
+           max(20px, env(safe-area-inset-left, 0px));
   opacity: 0;
   visibility: hidden;
   transition: opacity 0.45s ease, visibility 0.45s ease;
@@ -767,7 +770,7 @@ select {
 /* ─── Toast (reconnected message) ─── */
 .toast {
   position: fixed;
-  bottom: 24px;
+  bottom: max(24px, env(safe-area-inset-bottom, 0px));
   left: 50%;
   transform: translateX(-50%) translateY(80px);
   padding: 12px 20px;
@@ -791,8 +794,8 @@ select {
 /* ─── Connection Status Pip ─── */
 .connection-status {
   position: fixed;
-  bottom: 12px;
-  right: 12px;
+  bottom: max(12px, env(safe-area-inset-bottom, 0px));
+  right: max(12px, env(safe-area-inset-right, 0px));
   z-index: 99;
   display: flex;
   align-items: center;
@@ -866,4 +869,30 @@ select {
   .card.glass {
     padding: 40px 36px;
   }
+}
+
+/* ─── PWA install hint (iOS has no beforeinstallprompt) ─── */
+.ios-install-hint {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  text-align: center;
+  line-height: 1.45;
+}
+
+.ios-install-hint[hidden],
+#btn-install[hidden] {
+  display: none !important;
+}
+
+.hint-dismiss {
+  display: inline;
+  margin-left: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--primary);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
 }

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Impostor">
+  <rect width="512" height="512" fill="#0b0e17"/>
+  <defs>
+    <radialGradient id="g1" cx="28%" cy="22%" r="46%"><stop offset="0%" stop-color="#a855f7" stop-opacity=".55"/><stop offset="100%" stop-color="#a855f7" stop-opacity="0"/></radialGradient>
+    <radialGradient id="g2" cx="78%" cy="80%" r="40%"><stop offset="0%" stop-color="#f97316" stop-opacity=".45"/><stop offset="100%" stop-color="#f97316" stop-opacity="0"/></radialGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#g1)"/>
+  <rect width="512" height="512" fill="url(#g2)"/>
+  <g transform="rotate(-8 256 266)">
+    <ellipse cx="256" cy="266" rx="136" ry="174" fill="#eaedf3"/>
+    <ellipse cx="198" cy="248" rx="32" ry="24" fill="#0b0e17"/>
+    <ellipse cx="314" cy="248" rx="32" ry="24" fill="#0b0e17"/>
+    <path d="M186 318c28 48 112 48 140 0" fill="none" stroke="#0b0e17" stroke-width="18" stroke-linecap="round"/>
+    <path d="M318 338l18 22 36-18" fill="none" stroke="#f97316" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>
